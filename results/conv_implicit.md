@@ -68,3 +68,42 @@ At 224x224 the deep layers' x*y is just small (14x14, 7x7). With a larger input,
 All bit-exact vs the CPU integers. 1024 layer2-4 run at 2.6-4.3 TOPS; layer1 (64 channels,
 K step 64) at 1.0 TOPS. Each tap still re-reads its A block from DDR (9x the input traffic);
 loading an x*y tile plus halo once into L2 for all 9 taps is the next compiler step.
+
+## Requantize on the core after the K loop (tools/conv_implicit/epilogue.py, ep_isolate.py, ep_ir.py)
+
+K is looped in time on one core (no split-K), so each accumulator is complete when the loop
+ends and an elementwise tail can run on it in L1 before the write-back (Triton-XDNA
+`generate_matmul_transform(..., epilogue=True)`). GEMM 512x512x1152 int8, B512x256_L1128x64_K128:
+
+| tail | ms | out | |
+|---|---|---|---|
+| none (int32) | 0.413-0.431 | 1.05 MB | |
+| `max(acc, 0)` int32 | 0.490 | 1.05 MB | exact |
+| `acc.to(f32) * c` | 0.962 | 1.05 MB | ok with a constexpr c; a runtime scalar arrives as 0 (silently wrong) |
+| `relu(acc * c).to(bf16)` | 0.932 | 0.52 MB | rel err 1% |
+| `max(acc * c + .5, 0).to(int8)` | 1.310 | 0.26 MB | f32->i8 wraps instead of saturating in the conv runs |
+| `(acc >> s).to(int8)`, 32 lanes | **0.416** | 0.26 MB | one `aievec.srs`; = round-half-up, saturating |
+
+The f32 tails cost 0.5-0.9 ms (f32 elementwise on AIE2P); the SRS tail is free. In the conv:
+
+| layer | int32 out | SRS int8 out |
+|---|---|---|
+| 224 layer1 | 0.586 ms, 1.05 MB | 0.565 ms, 0.26 MB |
+| 224 layer3 | 0.317 ms, 0.26 MB | 0.327 ms, 0.07 MB |
+| 1024 layer1 | 4.745 ms, 17.0 MB | 4.310 ms, 4.26 MB |
+| 1024 layer3 | 1.137 ms, 4.72 MB | 1.043 ms, 1.18 MB |
+
+Bit-exact against round-half-up. 4x fewer bytes but at most 9% faster: the int32 write-back was
+not the bottleneck (17 MB in 4.7 ms = 3.6 GB/s). What it buys is an int8 output the next layer
+can read directly.
+
+Toolchain gaps hit:
+* The epilogue herd vectorizes 16 lanes; AIE2P SRS (i32->i8) lowers only for 32/64 lanes
+  ("failed to legalize aievec.srs"). Tiling the tail 4 rows x 8 (32 lanes) instead works.
+* ReLU on the int8 result is hoisted before the truncation into a 32-lane i32 compare, which
+  Peano cannot legalize (`G_ICMP <32 x s32>`). At 16 lanes the compare works but SRS does not.
+  Needs a Peano legalizer split, or SRS with unsigned saturation (sign=0) as a free ReLU.
+* Runtime scalars do not reach the epilogue herd (reads 0); constexpr only.
+* `arith.minnumf` on f32 vectors and `aievec.mul_elem` i32 x i32 do not lower.
+* examples/matmul_bf16_epilogue does not compile in this sandbox ("requires exactly one
+  producer_op handle (got 2)").
