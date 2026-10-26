@@ -18,7 +18,7 @@ a = torch.randint(-20, 20, (M, K), dtype=torch.int8); b = torch.randint(-20, 20,
 ar, br = res.to_npu(a), res.to_npu(b, static=True); cr = res.empty((M, N), dtype=torch.int32)
 sched = kernels.schedule(t)
 cfg = Mo["npu_config"]; Mo["triton"].runtime.driver.set_active(Mo["driver"])
-cfg._transform_tiling_script = sched; cfg._air_project_path = kernels.project_dir()
+cfg._transform_tiling_script = sched; cfg._air_project_path = os.environ.get("KEEP_PROJ") or kernels.project_dir()
 k = Mo["kernel"]
 launch = lambda: k[(M // t.block_m, N // t.block_n)](ar, br, cr, N, K, BLOCK_M=t.block_m, BLOCK_N=t.block_n, BLOCK_K=t.l2_k)
 launch()
