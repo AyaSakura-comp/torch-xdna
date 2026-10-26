@@ -49,6 +49,11 @@ def mm_ep(A, B, C, N: tl.constexpr, K: tl.constexpr, SCALE, EP: tl.constexpr, KL
         tl.store(c_ptrs, tl.maximum((acc >> 8).to(tl.int8), 0))
     elif EP == "srs_only32":
         tl.store(c_ptrs, (acc >> 8).to(tl.int8))
+    elif EP == "srs_then_relu32":
+        y = tl.minimum(tl.maximum(acc >> 8, -128), 127).to(tl.int8)
+        tl.store(c_ptrs, tl.maximum(y, 0))
+    elif EP == "srs_relu_u8_32":
+        tl.store(c_ptrs, tl.minimum(tl.maximum(acc >> 8, 0), 255).to(tl.uint8))
     elif EP == "srs_relu_i16":
         tl.store(c_ptrs, tl.maximum((acc >> 8).to(tl.int16), 0))
     elif EP == "i8_srs32":
@@ -76,10 +81,10 @@ def run(dtype, kloop, ep, M=256, N=256, K=256, t=Tiling(256, 256, 64, 64, 128)):
         a = torch.randn(M, K).bfloat16(); b = (torch.randn(K, N) * 0.1).bfloat16()
         acc = a.float() @ b.float()
     scale = 0.01
-    odt = {"srs_relu32": torch.int8, "srs_only32": torch.int8, "srs_relu_i16": torch.int16, "q_f2i8": torch.int8, "bf16_relu_c": torch.bfloat16, "q_bf16min": torch.int8, "i8_srs32": torch.int8, "f32_plain": torch.float32, "f32_cscale": torch.float32, "i32_mul": torch.int32, "i8_trunc": torch.int8,
+    odt = {"srs_relu_u8_32": torch.uint8, "srs_relu32": torch.int8, "srs_only32": torch.int8, "srs_relu_i16": torch.int16, "q_f2i8": torch.int8, "bf16_relu_c": torch.bfloat16, "q_bf16min": torch.int8, "i8_srs32": torch.int8, "f32_plain": torch.float32, "f32_cscale": torch.float32, "i32_mul": torch.int32, "i8_trunc": torch.int8,
            "i16_shift": torch.int16, "f32": torch.float32, "f32_relu": torch.float32, "bf16": torch.bfloat16, "i32_relu": torch.int32,
            "i8_shift": torch.int8}[ep]
-    want = {"srs_relu32": lambda: (acc >> 8).clamp(0, 127), "srs_only32": lambda: (acc >> 8).clamp(-128, 127),
+    want = {"srs_relu_u8_32": lambda: (acc >> 8).clamp(0, 255), "srs_relu32": lambda: (acc >> 8).clamp(0, 127), "srs_only32": lambda: (acc >> 8).clamp(-128, 127),
             "srs_relu_i16": lambda: (acc >> 8).clamp(min=0), "q_f2i8": lambda: (acc.float() * 0.01 + 0.5).clamp(min=0).floor().clamp(max=127),
             "bf16_relu_c": lambda: (acc.float() * 0.01).relu(),
             "q_bf16min": lambda: (acc.float() * 0.01).relu().bfloat16().float().clamp(max=127).trunc(),
