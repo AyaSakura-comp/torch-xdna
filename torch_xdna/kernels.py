@@ -74,36 +74,94 @@ def resident():
     return _mod["resident"]
 
 
-def schedule(block_m: int) -> str:
-    """The AIR tiling script for this row block (generated once, cached on disk)."""
+class Tiling(tuple):
+    """(block_m, block_n, l1_m, l1_n, l2_k): one launch program covers block_m x block_n of C,
+    spread over a herd of (block_m / l1_m) x (block_n / l1_n) cores; K advances l2_k per step."""
+
+    __slots__ = ()
+
+    def __new__(cls, block_m, block_n, l1_m, l1_n, l2_k=BLOCK_K):
+        return super().__new__(cls, (block_m, block_n, l1_m, l1_n, l2_k))
+
+    block_m = property(lambda s: s[0])
+    block_n = property(lambda s: s[1])
+    l1_m = property(lambda s: s[2])
+    l1_n = property(lambda s: s[3])
+    l2_k = property(lambda s: s[4])
+
+    def herd(self):
+        return self.block_m // self.l1_m, self.block_n // self.l1_n
+
+    def __str__(self):
+        return f"B{self.block_m}x{self.block_n}_L1{self.l1_m}x{self.l1_n}_K{self.l2_k}"
+
+
+def default_tiling(block_m: int) -> Tiling:
     l1_m, l1_n = L1[block_m]
-    path = CACHE / f"transform_i8_k{BLOCK_K}_{l1_m}x{l1_n}.mlir"
+    return Tiling(block_m, BLOCK_N, l1_m, l1_n, BLOCK_K)
+
+
+_tuned = None
+
+
+def tuned_table():
+    """{(M, N, K): Tiling} from a sweep (tools/sweep.py); TORCH_XDNA_TUNED overrides the shipped one."""
+    global _tuned
+    if _tuned is None:
+        import json
+
+        path = os.environ.get("TORCH_XDNA_TUNED") or str(Path(__file__).parent / "tuned" / "strix_halo_i8.json")
+        _tuned = {}
+        if os.path.exists(path):
+            import re
+
+            for key, v in json.load(open(path)).items():
+                m = re.fullmatch(r"B(\d+)x(\d+)_L1(\d+)x(\d+)_K(\d+)", v["tiling"])
+                if m:
+                    _tuned[tuple(int(x) for x in key.split("x"))] = Tiling(*map(int, m.groups()))
+    return _tuned
+
+
+def tiling_for(M: int, N: int, K: int) -> Tiling:
+    """The swept best tiling for this launch when there is one that fits, else the default for its rows."""
+    t = tuned_table().get((M, N, K))
+    if t is not None and M % t.block_m == 0 and N % t.block_n == 0 and K % t.l2_k == 0:
+        return t
+    return default_tiling(512 if M % 512 == 0 else (256 if M % 256 == 0 else 128))
+
+
+def schedule(t) -> str:
+    """The AIR tiling script for a tiling (generated once, cached on disk)."""
+    t = t if isinstance(t, Tiling) else default_tiling(t)
+    path = CACHE / f"transform_i8_k{t.l2_k}_{t.l1_m}x{t.l1_n}.mlir"
     if not path.exists():
         from triton.backends.amd_triton_npu.matmul_transform import generate_matmul_transform
 
         tmp = path.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_text(generate_matmul_transform(l1_m=l1_m, l1_n=l1_n, l2_k=BLOCK_K,
+        tmp.write_text(generate_matmul_transform(l1_m=t.l1_m, l1_n=t.l1_n, l2_k=t.l2_k,
                                                  pack_sizes=(8, 8, 8), accum_type="i32", k_loop=True))
         tmp.replace(path)
     return str(path)
 
 
-def mm_i8(a, w, c, block_m: int):
+def mm_i8(a, w, c, tiling, project=None):
     """c[M, N] = a[M, K] @ w[K, N] on the NPU; int8 in, int32 out, all resident.
 
-    M must be a multiple of block_m, N of BLOCK_N, K of BLOCK_K. The schedule
-    and the build directory are process-global settings of Triton-XDNA, read
-    at launch, so they are set around this launch and restored after.
+    `tiling` is a Tiling or a row block (then the default tiling for it). M
+    must be a multiple of block_m, N of block_n, K of l2_k. The schedule and
+    the build directory are process-global settings of Triton-XDNA, read at
+    launch, so they are set around this launch and restored after.
     """
+    t = tiling if isinstance(tiling, Tiling) else default_tiling(tiling)
     M, K = a.shape
     N = w.shape[1]
     cfg = _mod["npu_config"]
     _mod["triton"].runtime.driver.set_active(_mod["driver"])  # per thread
     saved = (cfg._transform_tiling_script, cfg._air_project_path)
-    cfg._transform_tiling_script = schedule(block_m)
-    cfg._air_project_path = str(CACHE / "air_project")
+    cfg._transform_tiling_script = schedule(t)
+    cfg._air_project_path = project or str(CACHE / "air_project")
     try:
-        _mod["kernel"][(M // block_m, N // BLOCK_N)](
-            a, w, c, N, K, BLOCK_M=block_m, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
+        _mod["kernel"][(M // t.block_m, N // t.block_n)](
+            a, w, c, N, K, BLOCK_M=t.block_m, BLOCK_N=t.block_n, BLOCK_K=t.l2_k)
     finally:
         cfg._transform_tiling_script, cfg._air_project_path = saved

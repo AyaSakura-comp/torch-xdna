@@ -136,7 +136,7 @@ def _cpu_acc(xq, qw):
     return torch._int_mm(xq, qw.w_kn)
 
 
-def _npu_acc(xq, qw, buckets):
+def _npu_acc(xq, qw, buckets, tuned=True):
     """int32 [R, N] from the NPU, as launches of at most the largest bucket's rows."""
     R = xq.shape[0]
     out = torch.empty((R, qw.N), dtype=torch.int32)
@@ -149,7 +149,7 @@ def _npu_acc(xq, qw, buckets):
         a[:r, : qw.K].copy_(xq[r0: r0 + r])
         if qw.Kp != qw.K:
             a[:r, qw.K:].zero_()
-        kernels.mm_i8(a, w, c, _block_m(M))
+        kernels.mm_i8(a, w, c, kernels.tiling_for(M, qw.Np, qw.Kp) if tuned else _block_m(M))
         stats.launches += 1
         out[r0: r0 + r].copy_(c[:r, : qw.N])
     return out
@@ -179,7 +179,7 @@ def _choose(cfg, xq, qw):
         return "cpu"
     hit = decisions.get(key)
     if hit is None:
-        npu_ms = _time(lambda: _npu_acc(xq, qw, cfg.row_buckets))
+        npu_ms = _time(lambda: _npu_acc(xq, qw, cfg.row_buckets, cfg.tuned_tilings))
         cpu_ms = _time(lambda: _cpu_acc(xq, qw))
         hit = ("npu" if npu_ms < cpu_ms else "cpu", round(npu_ms, 3), round(cpu_ms, 3))
         decisions[key] = hit
@@ -199,7 +199,7 @@ def _gemm(cfg, x2d, qw):
         device = _choose(cfg, xq, qw)
         if device == "npu":
             try:
-                return _npu_acc(xq, qw, cfg.row_buckets), sx, "npu"
+                return _npu_acc(xq, qw, cfg.row_buckets, cfg.tuned_tilings), sx, "npu"
             except Exception as e:  # compile / context / launch failure: this shape moves to the CPU
                 shape = (_bucket(xq.shape[0], cfg.row_buckets), qw.N, qw.K)
                 _failed.add(shape)

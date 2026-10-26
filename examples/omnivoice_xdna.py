@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--policy", default="npu", choices=["npu", "auto", "cpu"])
     ap.add_argument("--fallback", default="inductor", choices=["inductor", "eager"])
     ap.add_argument("--eager", action="store_true", help="no torch.compile at all (fp32 baseline)")
+    ap.add_argument("--no-tuned", action="store_true", help="default tiling per row bucket, not the swept table")
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--threads", type=int, default=16)
@@ -45,10 +46,11 @@ def main():
     model = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cpu", dtype=torch.float32)
     if hasattr(model.llm, "_orig_mod"):  # the repo compiles the backbone for the GPU when triton imports
         model.llm = model.llm._orig_mod
-    tag = "eager-fp32" if args.eager else f"xdna-{args.policy}-{args.fallback}"
+    tag = "eager-fp32" if args.eager else f"xdna-{args.policy}-{args.fallback}" + ("-untuned" if args.no_tuned else "")
     if not args.eager:
         model.forward = torch.compile(model.forward, backend="xdna",
-                                      options={"policy": args.policy, "fallback": args.fallback})
+                                      options={"policy": args.policy, "fallback": args.fallback,
+                                               "tuned_tilings": not args.no_tuned})
 
     t = time.perf_counter()
     for text in TEXTS.values():  # compile: static shape first, then the dynamic-shape graph

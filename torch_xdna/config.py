@@ -33,6 +33,8 @@ class Config:
     min_macs: int = 2_000_000
     # Linears that read the same input (q/k/v, gate/up) run as one GEMM.
     fuse: bool = True
+    # Pick each NPU launch's tiling from the swept table (tools/sweep.py) instead of the per-row default.
+    tuned_tilings: bool = True
     verbose: bool = False
 
     def __post_init__(self):

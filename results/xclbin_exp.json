@@ -1,0 +1,22 @@
+{
+ "elf qkv exact": true,
+ "elf qkv same-shape ms": 0.6011,
+ "elf o exact": true,
+ "elf o same-shape ms": 0.3537,
+ "elf alternate qkv/o ms per run": 0.4489,
+ "xclbin qkv exact": true,
+ "xclbin qkv same-shape ms": 0.3078,
+ "xclbin o exact": true,
+ "xclbin o same-shape ms": 0.1577,
+ "xclbin alternate qkv/o ms per run": 1.4266,
+ "elf tiny B128x512_L164x128_K128 cores=8": 0.2231,
+ "xclbin tiny B128x512_L164x128_K128 cores=8": 0.0926,
+ "elf tiny B128x512_L132x128_K128 cores=16": 0.2795,
+ "xclbin tiny B128x512_L132x128_K128 cores=16": 0.0916,
+ "elf tiny B128x512_L116x128_K128 cores=32": 0.3852,
+ "xclbin tiny B128x512_L116x128_K128 cores=32": 0.0863,
+ "elf tiny B128x256_L164x128_K128 cores=4": 0.212,
+ "xclbin tiny B128x256_L164x128_K128 cores=4": 0.1139,
+ "elf tiny B128x256_L1128x128_K128": "fail: Command '['/home/chihmin/src/omnivoice-npu/venv/bin/python', '/home/chihmin/src/torch-xdna/tools/xclbin_exp.py', '--build', '/home/chihmin/.cache/torc",
+ "xclbin tiny B128x256_L1128x128_K128": "fail: Command '['/home/chihmin/src/omnivoice-npu/venv/bin/python', '/home/chihmin/src/torch-xdna/tools/xclbin_exp.py', '--build', '/home/chihmin/.cache/torc"
+}

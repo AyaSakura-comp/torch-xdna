@@ -1,0 +1,53 @@
+{
+ "herd(4,4) npu2_4col": {
+  "same_shape_ms": {
+   "qkv": 0.3939,
+   "o": 0.2179,
+   "gate_up": 0.5056,
+   "down": 0.2622
+  },
+  "sum_same_ms": 1.3796,
+  "round_robin_ms_per_run": 1.463,
+  "partitions": [
+   "Columns: [0, 1, 2, 3, 4, 5, 6, 7]",
+   "|4086062             |1          |235         |0           |0    |Normal   |",
+   "|4086062             |2          |235         |0           |0    |Normal   |",
+   "|4086062             |3          |235         |0           |0    |Normal   |",
+   "|4086062             |4          |235         |0           |0    |Normal   |"
+  ]
+ },
+ "herd(2,2) npu2_2col": {
+  "same_shape_ms": {
+   "qkv": 0.6429,
+   "o": 0.3373,
+   "gate_up": 0.9067,
+   "down": 0.4406
+  },
+  "sum_same_ms": 2.3275,
+  "round_robin_ms_per_run": 0.9104,
+  "partitions": [
+   "Columns: [0, 1, 2, 3, 4, 5, 6, 7]",
+   "|4086062             |5          |342         |0           |0    |Normal   |",
+   "|4086062             |6          |342         |0           |0    |Normal   |",
+   "|4086062             |7          |342         |0           |0    |Normal   |",
+   "|4086062             |8          |341         |0           |0    |Normal   |"
+  ]
+ },
+ "herd(4,4) npu2 (full)": {
+  "same_shape_ms": {
+   "qkv": 0.3117,
+   "o": 0.1567,
+   "gate_up": 0.4026,
+   "down": 0.1885
+  },
+  "sum_same_ms": 1.0595,
+  "round_robin_ms_per_run": 1.4465,
+  "partitions": [
+   "Columns: [0, 1, 2, 3, 4, 5, 6, 7]",
+   "|4086062             |9          |232         |0           |0    |Normal   |",
+   "|4086062             |10         |232         |0           |0    |Normal   |",
+   "|4086062             |11         |232         |0           |0    |Normal   |",
+   "|4086062             |12         |232         |0           |0    |Normal   |"
+  ]
+ }
+}
