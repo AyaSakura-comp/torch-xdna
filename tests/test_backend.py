@@ -11,6 +11,7 @@ import torch
 
 import torch_xdna
 from torch_xdna import runtime
+from torch_xdna.conv import conv3x3_int8
 
 torch.manual_seed(0)
 
@@ -187,11 +188,116 @@ def case_no_npu():
     y_fp = run(net, x, policy="npu", cpu_kernel="fp")
     e_int8, e_fp = rel_err(y, ref), rel_err(y_fp, ref)
     assert e_int8 < 0.03 and e_fp < 1e-5, (e_int8, e_fp)
-    print(f"PASS no NPU: cpu int8 rel err {e_int8:.4f}, cpu fp rel err {e_fp:.2e}")
+    cnn = CNN().eval()
+    xc = torch.randn(1, 64, 32, 64)
+    with torch.no_grad():
+        ref_c = cnn(xc)
+    y_c = run(cnn, xc, policy="npu")
+    assert runtime.stats.as_dict()["calls"] == {}
+    e_c = rel_err(y_c, ref_c)
+    assert e_c < 1e-5, e_c
+    print(f"PASS no NPU: cpu int8 rel err {e_int8:.4f}, cpu fp rel err {e_fp:.2e}; convs left as fp convs, "
+          f"rel err {e_c:.2e}")
+
+
+class CNN(torch.nn.Module):
+    """3x3 convs: with a bias (its ReLU stays in Inductor), without (ReLU fused on the NPU), padding
+    "same", and a stride-2 one the NPU op does not take."""
+
+    def __init__(self):
+        super().__init__()
+        self.c1 = torch.nn.Conv2d(64, 128, 3, padding=1)
+        self.c2 = torch.nn.Conv2d(128, 128, 3, padding=1, bias=False)
+        self.c3 = torch.nn.Conv2d(128, 32, 3, padding="same")
+        self.down = torch.nn.Conv2d(32, 32, 3, stride=2, padding=1)
+
+    def forward(self, x):
+        h = torch.relu(self.c1(x))
+        h = torch.relu(self.c2(h))
+        return self.down(self.c3(h))
+
+
+def case_conv_pass():
+    """Which convs the pass rewrites, and which ReLU it fuses."""
+    if not torch_xdna.npu_available():
+        print("SKIP conv pass: no NPU (convs are left alone)")
+        return
+    graphs = []
+
+    def capture(gm, example_inputs):
+        torch_xdna.offload_gemms(gm, example_inputs, torch_xdna.Config(policy="npu"))
+        graphs.append(gm)
+        return gm.forward
+
+    torch._dynamo.reset()
+    with torch.no_grad():
+        torch.compile(CNN().eval(), backend=capture)(torch.randn(1, 64, 16, 64))
+    nodes = [n for n in graphs[0].graph.nodes if n.op == "call_function"]
+    convs = [n for n in nodes if n.target is conv3x3_int8]
+    assert [n.args[3] for n in convs] == [False, True, False], [n.args for n in convs]
+    assert sum(n.target in (torch.relu, torch.nn.functional.relu) for n in nodes) == 1
+    assert sum(n.target is torch.conv2d for n in nodes) == 1          # the stride-2 one
+    print("PASS conv pass: 3 of 4 convs -> xdna::conv3x3, the bias-free one's ReLU fused, stride 2 left alone")
+
+
+def case_conv():
+    """3x3 convs on the NPU: close to fp32 eager, every layer's first launch bitwise == the CPU integers."""
+    if not torch_xdna.npu_available():
+        print("SKIP conv: no NPU")
+        return
+    net = CNN().eval()
+    x = torch.randn(2, 64, 32, 64)
+    with torch.no_grad():
+        ref = net(x)
+    y = run(net, x, policy="npu")
+    s = runtime.stats.as_dict()
+    assert s["calls"] == {"npu": 3} and not s["fallbacks"], s
+    e = rel_err(y, ref)
+    assert e < 0.05, f"rel err vs fp32 {e}"
+    from torch_xdna import conv as xconv
+
+    for _, layer in xconv._layers.values():      # the same layers (and shifts), routed to the CPU
+        layer.device = "cpu"
+    y_cpu = run(net, x, policy="npu")
+    assert runtime.stats.as_dict()["calls"] == {"cpu": 3}
+    assert torch.equal(y, y_cpu), "NPU and CPU integers differ"
+    print(f"PASS conv: 3 convs (batch 2) on the NPU in {s['npu_launches']} launches, == the CPU's integers, "
+          f"rel err vs fp32 {e:.4f}")
+
+
+def case_conv_silent_wrong():
+    """A conv launch returning one wrong value is caught on the layer's first launch; that layer
+    moves to the CPU (fp conv) and the model's output is still right."""
+    if not torch_xdna.npu_available():
+        print("SKIP conv silent wrong: no NPU")
+        return
+    from triton.language.extra.npu import conv3x3
+
+    real = conv3x3.Conv3x3.__call__
+
+    def corrupt(self, x, out=None):
+        y = real(self, x, out)
+        if self.ci == 128 and self.co == 32:     # only c3
+            y[0, 0, 0] += 1
+        return y
+
+    conv3x3.Conv3x3.__call__ = corrupt
+    net = CNN().eval()
+    x = torch.randn(1, 64, 32, 64)
+    with torch.no_grad():
+        ref = net(x)
+    y = run(net, x, policy="npu")
+    s = runtime.stats.as_dict()
+    assert len(s["fallbacks"]) == 1 and "disagrees with the CPU" in s["fallbacks"][0][1], s["fallbacks"]
+    assert s["calls"] == {"npu": 2, "cpu": 1}, s["calls"]
+    e = rel_err(y, ref)
+    assert e < 0.05, e
+    print(f"PASS conv silent wrong -> {s['fallbacks'][0][1][:70]}...; c3 on the CPU, rel err vs fp32 {e:.4f}")
 
 
 CASES = {f.__name__[5:]: f for f in (case_numerics, case_split_and_eager, case_auto, case_fusion, case_silent_wrong,
-                                      case_launch_failure, case_no_npu)}
+                                      case_launch_failure, case_no_npu, case_conv_pass, case_conv,
+                                      case_conv_silent_wrong)}
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

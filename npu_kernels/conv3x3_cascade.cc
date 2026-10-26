@@ -105,8 +105,8 @@ static inline void conv3x3_line(const v64int8 *__restrict line0, const v64int8 *
       v64int8 *__restrict o0 = O + (2 * og) * (OW / 8) + pb * 2;
       v64int8 *__restrict o1 = o0 + OW / 8;
       if constexpr (RELU) {
-        o0[0] = (v64int8)to_v64uint8(c00, shift, 1); o0[1] = (v64int8)to_v64uint8(c10, shift, 1);
-        o1[0] = (v64int8)to_v64uint8(c01, shift, 1); o1[1] = (v64int8)to_v64uint8(c11, shift, 1);
+        o0[0] = (v64int8)to_v64uint8(c00, shift, 0); o0[1] = (v64int8)to_v64uint8(c10, shift, 0);
+        o1[0] = (v64int8)to_v64uint8(c01, shift, 0); o1[1] = (v64int8)to_v64uint8(c11, shift, 0);
       } else {
         o0[0] = to_v64int8(c00, shift, 1); o0[1] = to_v64int8(c10, shift, 1);
         o1[0] = to_v64int8(c01, shift, 1); o1[1] = to_v64int8(c11, shift, 1);

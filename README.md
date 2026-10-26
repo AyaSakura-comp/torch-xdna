@@ -1,6 +1,6 @@
 # torch-xdna
 
-A `torch.compile` backend that runs a model's GEMMs on the AMD XDNA NPU
+A `torch.compile` backend that runs a model's GEMMs and 3x3 convolutions on the AMD XDNA NPU
 (Ryzen AI, npu2 / AIE2P) through [Triton-XDNA](https://github.com/AyaSakura-comp/Triton-XDNA),
 and everything else on the CPU.
 
@@ -24,6 +24,8 @@ torch.compile(model, backend="xdna")
   Dynamo FX graph
    ├─ F.linear(x, W, b) / x @ W  with W a parameter   ──►  xdna::linear  (custom op)
    │    linears reading the same x (q/k/v, gate/up)   ──►  xdna::linear_cat (one GEMM) + narrow
+   ├─ conv2d 3x3 / stride 1 / pad 1, W a parameter    ──►  quantize ─► xdna::conv3x3 ─► dequantize
+   │    (+ ReLU of a bias-free conv, fused)                (int8 op; the rest is ordinary ops)
    └─ everything else (attention, norms, RoPE, sampling, ...)
   Inductor compiles the graph for the CPU; the xdna ops are extern calls in it
 
@@ -44,10 +46,48 @@ xdna::linear at run time (runtime.py)
   (128/256/512/1024); more rows than the largest bucket are split.
 * Patterns offloaded: `F.linear(x, W, b)`, `x @ W` / `torch.mm` / `x.matmul(W)`, and
   `torch.addmm(b, x, W)` (HF `Conv1D`, as in GPT-2), with `W` a 2-D parameter.
-  Convolutions are not offloaded (ResNet-50 puts 0.05% of its FLOPs on the NPU).
+  3x3 / stride-1 convolutions run as `xdna::conv3x3` (next section); other convolutions
+  stay on the CPU.
 * Activation × activation matmuls (attention) are not offloaded: their operands
   change every call, and at these sizes one NPU launch (~0.3 ms) costs more
   than the whole GEMM on the CPU.
+
+## 3x3 convolutions: the cascade op
+
+`xdna::conv3x3` runs Triton-XDNA's `tl.extra.npu.conv3x3` (branch `feat/npu-conv3x3`): every
+core keeps its weights for the whole image, the input channels are split over two vertically
+adjacent cores whose partial sums meet over the AIE cascade, and the tail core requantizes
+(shift, round, saturate; ReLU as unsigned saturation). 16 such chains fill the array. How it was
+built, measured and traced: [results/conv3x3_cascade.md](results/conv3x3_cascade.md).
+
+| Ci = Co = 256 | NPU time | int8 TOPS |
+|---|---|---|
+| 1536 x 64, NPU time (IRON harness) | 2.205 ms | **52.6 (86% of 61)** |
+| 1536 x 64, one call incl. host layouts | 4.95 ms | 23.4 |
+| 256 x 256, one call incl. host layouts | 3.35 ms | 23.1 |
+
+In the graph the conv becomes per-image quantize -> `xdna::conv3x3` (int8 in, int8 out plus a
+per-channel scale) -> dequantize (+ bias); the quantize and dequantize are ordinary ops that
+Inductor fuses with their neighbours. Weights are int8 per output channel, the shift is fixed on
+a layer's first call (25% headroom over its integer sums), and the CPU route computes the same
+integers, so the first NPU launch of every layer is checked bit for bit. Taken: 3x3, stride 1,
+padding 1 or `"same"`, groups 1, Ci 16..256 in steps of 16, Co a multiple of 32, W a multiple of
+64 (so ResNet-50 at 224x224, with 56/28/14/7-wide maps, gets none). Without an NPU, or with
+`policy="cpu"`, convs are left as they are (int8 has no CPU conv kernel to gain from); a layer
+whose NPU launch fails at run time computes the same integers on the CPU.
+
+`examples/conv_xdna.py`, four bias-free 3x3 convs + ReLU, 256 channels, 1 x 64 x 64, median of
+10 (the same run, machine otherwise lightly loaded):
+
+| | ms | TOPS |
+|---|---|---|
+| Inductor, fp32, CPU | 5.72 | 3.4 |
+| `xdna`, `policy="npu"`, end to end | **1.68** | 11.5 (rel err vs fp32 3.4%) |
+| the NPU launches alone | 0.80 | 24.2 |
+
+The rest of the end-to-end time is the host: quantize / dequantize (Inductor), the int8 layout
+change around each launch, and ~0.1 ms per launch. Under heavier CPU load the fp32 CPU run took
+11.7 ms and the NPU run 2.0 ms.
 
 ## Precision, and how wrong answers are kept out
 

@@ -26,7 +26,7 @@ class Stats:
         self.reset()
 
     def reset(self):
-        self.calls = defaultdict(int)       # device -> GEMM calls
+        self.calls = defaultdict(int)       # device -> op calls (GEMMs and convs)
         self.seconds = defaultdict(float)   # device -> wall seconds inside the op
         self.macs = defaultdict(int)        # device -> multiply-accumulates (unpadded)
         self.launches = 0                   # NPU launches (a call may split into several)

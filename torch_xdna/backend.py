@@ -1,10 +1,12 @@
-"""torch.compile(model, backend="xdna"): GEMMs on the XDNA NPU, everything else on the CPU.
+"""torch.compile(model, backend="xdna"): GEMMs and 3x3 convs on the XDNA NPU, everything else on the CPU.
 
 The pass works on Dynamo's FX graph. A GEMM against a parameter --
 `F.linear(x, W, b)`, or `x @ W` with a 2-D parameter W -- becomes xdna::linear;
-the rest of the graph is left to Inductor (or run eagerly). What runs where is
-decided per call at run time (see runtime.py), so a missing or failing NPU only
-moves GEMMs back to the CPU.
+a 3x3 / stride-1 / padding-1 conv2d with a parameter weight becomes quantize ->
+xdna::conv3x3 -> dequantize (conv.py); the rest of the graph is left to Inductor
+(or run eagerly). What runs where is decided per call at run time (see
+runtime.py, conv.py), so a missing or failing NPU only moves GEMMs and convs
+back to the CPU.
 
 GEMMs between two activations (attention scores) are not offloaded: their
 operands change every call, and at these sizes a launch (~0.3 ms) costs more
@@ -18,11 +20,13 @@ import torch
 import torch.nn.functional as F
 
 from . import config as _config
-from . import ops
+from . import kernels, ops
 
 log = logging.getLogger("torch_xdna")
 
 LINEAR = {torch._C._nn.linear, F.linear}
+CONV2D = {torch.conv2d, F.conv2d}
+RELU = {torch.relu, F.relu, torch.relu_}
 MATMUL = {operator.matmul, torch.matmul}
 FLOATS = (torch.float32, torch.bfloat16, torch.float16)
 
@@ -50,7 +54,7 @@ def _weight_ok(node, attrs):
 
 
 def offload_gemms(gm: torch.fx.GraphModule, example_inputs, cfg) -> int:
-    """Rewrite offloadable GEMMs to xdna::linear in place; return how many."""
+    """Rewrite offloadable GEMMs to xdna::linear and 3x3 convs to xdna::conv3x3 in place; return how many."""
     static = _static_placeholders(gm, example_inputs)
 
     def attr(target):
@@ -100,8 +104,68 @@ def offload_gemms(gm: torch.fx.GraphModule, example_inputs, cfg) -> int:
         count += 1
     if cfg.fuse:
         _fuse_shared_input(gm, cid)
+    count += _offload_convs(gm, static, cid, attr, cfg)
     gm.graph.lint()
     gm.recompile()
+    return count
+
+
+def _conv_args(node):
+    """(x, weight, bias, stride, padding, dilation, groups) of a conv2d call."""
+    names = ("input", "weight", "bias", "stride", "padding", "dilation", "groups")
+    defaults = dict(bias=None, stride=1, padding=0, dilation=1, groups=1)
+    args = dict(zip(names, node.args), **node.kwargs)
+    return [args.get(k, defaults.get(k)) for k in names]
+
+
+def _pair(v):
+    return tuple(v) if isinstance(v, (tuple, list)) else (v, v)
+
+
+def _offload_convs(gm, static, cid, attr, cfg):
+    """3x3 / stride 1 / padding 1 / groups 1 convolutions of a parameter weight -> conv3x3_int8
+    (quantize, xdna::conv3x3, dequantize; Inductor fuses the first and last with their neighbours).
+
+    A ReLU that is the conv's only user (and the conv has no bias, so the ReLU applies to the
+    requantized sums themselves) is fused: the NPU saturates to [0, 255] instead.
+    """
+    from .conv import conv3x3_int8, supported
+
+    # int8 convs only pay off on the NPU (the CPU has no int8 conv kernel): without one, or with
+    # policy "cpu", the convs stay as they are
+    if cfg.policy == "cpu" or not kernels.available():
+        return 0
+    count = 0
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target not in CONV2D:
+            continue
+        x, w, b, stride, padding, dilation, groups = _conv_args(node)
+        if (_pair(stride) != (1, 1) or (padding != "same" and _pair(padding) != (1, 1))
+                or _pair(dilation) != (1, 1) or groups != 1):
+            continue
+        if not (isinstance(w, torch.fx.Node) and (w in static or w.op == "get_attr")):
+            continue
+        wt = w.meta.get("example_value") if w.op == "placeholder" else attr(w.target)
+        xt = x.meta.get("example_value") if isinstance(x, torch.fx.Node) else None
+        if not (isinstance(wt, torch.Tensor) and wt.dim() == 4 and tuple(wt.shape[2:]) == (3, 3)
+                and isinstance(xt, torch.Tensor) and xt.dim() == 4 and xt.dtype in FLOATS):
+            continue
+        if not supported(int(wt.shape[1]), int(wt.shape[0]), int(xt.shape[2]), int(xt.shape[3])):
+            continue
+        users = list(node.users)
+        relu = None
+        if cfg.fuse and b is None and len(users) == 1 and (
+                (users[0].op == "call_function" and users[0].target in RELU)
+                or (users[0].op == "call_method" and users[0].target in ("relu", "relu_"))):
+            relu = users[0]
+        with gm.graph.inserting_after(relu or node):
+            new = gm.graph.call_function(conv3x3_int8, (x, w, b, relu is not None, cid))
+        new.meta.update((relu or node).meta)
+        (relu or node).replace_all_uses_with(new)
+        if relu is not None:
+            gm.graph.erase_node(relu)
+        gm.graph.erase_node(node)
+        count += 1
     return count
 
 
@@ -144,7 +208,7 @@ def xdna_backend(gm: torch.fx.GraphModule, example_inputs, options=None, mode=No
     cfg = _config.config.merged(options)
     n = offload_gemms(gm, example_inputs, cfg)
     if cfg.verbose:
-        log.warning("torch_xdna: %d GEMMs offloadable in a graph of %d nodes (policy=%s, fallback=%s)",
+        log.warning("torch_xdna: %d GEMMs / convs offloadable in a graph of %d nodes (policy=%s, fallback=%s)",
                     n, len(gm.graph.nodes), cfg.policy, cfg.fallback)
     if cfg.fallback == "eager":
         return gm.forward
