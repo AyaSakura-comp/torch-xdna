@@ -35,3 +35,36 @@ Useful throughput 0.3-3.2 TOPS (NPU int8 peak 51). Whole ResNet-50 fp32 eager on
 16.7 ms at B=1, so 53 convs x the launch floor alone (~16-21 ms) already matches it: per-layer
 launches cannot win at batch 1; layers would have to be fused into one launch with the feature
 map kept on chip.
+
+## Batch 1: cut along x*y instead of batch (tools/conv_implicit/tile_xy.py, tile_res.py)
+
+The first tilings spread the herd over N (channels); for layer1 (N=64) that padded N to 128-256.
+Putting the cores on M (= the x*y output pixels) instead, batch 1, 224x224, best NPU kernel ms:
+
+| layer | channel-heavy tiling | x*y-heavy tiling | cpu fp32 conv |
+|---|---|---|---|
+| layer1 | 0.766 (B256x128, 16 cores) | 0.598 (B1024x64_L1128x32, 16 cores) | 0.21 |
+| layer2 | 0.455 (B256x256, 16) | 0.334 (B512x128_L1128x64, 8) | 0.19 |
+| layer3 | 0.391 (B256x256, 16) | 0.317 (B256x256_L164x128, 8) | 0.16 |
+| layer4 | 0.460 (B256x512, 16) | 0.322 (B64x512_L132x128, 8) | 0.20 |
+
+Fewer cores win at these sizes (the per-launch floor grows with the herd: ~0.21 ms at 4 cores,
+~0.39 ms at 32). Still ~0.3 ms floor per launch vs 0.15-0.2 ms for the whole CPU conv.
+L1 tiles of 128x128 int32 (16384 words) fail: AIE DMA BD max is 16383 words.
+
+At 224x224 the deep layers' x*y is just small (14x14, 7x7). With a larger input, batch 1:
+
+| input | layer | M = x*y | cpu fp32 | npu kernel | npu e2e (incl. Python layout) |
+|---|---|---|---|---|---|
+| 512 | layer1 | 16384 | 0.83 | 1.52 | 1.81 |
+| 512 | layer2 | 4096 | 0.70 | 0.67 | 0.92 |
+| 512 | layer3 | 1024 | 0.68 | 0.69 | 1.01 |
+| 512 | layer4 | 256 | 0.67 | 0.76 | 1.19 |
+| 1024 | layer1 | 65536 | 3.39 | 4.75 | 8.57 |
+| 1024 | layer2 | 16384 | 3.08 | 1.84 | 3.10 |
+| 1024 | layer3 | 4096 | 2.73 | 1.22 | 1.94 |
+| 1024 | layer4 | 1024 | 2.42 | 1.14 | 1.41 |
+
+All bit-exact vs the CPU integers. 1024 layer2-4 run at 2.6-4.3 TOPS; layer1 (64 channels,
+K step 64) at 1.0 TOPS. Each tap still re-reads its A block from DDR (9x the input traffic);
+loading an x*y tile plus halo once into L2 for all 9 taps is the next compiler step.
