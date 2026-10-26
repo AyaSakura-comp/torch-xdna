@@ -5,6 +5,7 @@ from dataclasses import dataclass, fields, replace
 POLICIES = ("auto", "npu", "cpu")
 FALLBACKS = ("inductor", "eager")
 CPU_KERNELS = ("int8", "fp")
+PRECISIONS = ("int8", "bf16")
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,11 @@ class Config:
     #   inductor  torch.compile's CPU code generator (fuses the pointwise ops)
     #   eager     run the graph as is
     fallback: str = "inductor"
+    # Offloaded GEMM math:
+    #   int8  W8A8 (per-channel weights, per-row activations), int32 accumulate; NPU == CPU bit for bit
+    #   bf16  bf16 operands (bfp16 MACs on AIE2P, 8 values per shared exponent), f32 accumulate;
+    #         the CPU route is the fp32 GEMM. More robust to activation outliers.
+    precision: str = "int8"
     # A GEMM the NPU does not take runs on the CPU as
     #   int8  the same W8A8 math (torch._int_mm), so results do not depend on routing
     #   fp    the original linear in the input dtype
@@ -35,12 +41,17 @@ class Config:
     fuse: bool = True
     # Pick each NPU launch's tiling from the swept table (tools/sweep.py) instead of the per-row default.
     tuned_tilings: bool = True
+    # Check NPU results against the CPU: "first" launch of every NPU program (catches a silently
+    # miscompiled program once; it then falls back to the CPU), "always", or "off".
+    verify: str = "first"
     verbose: bool = False
 
     def __post_init__(self):
         assert self.policy in POLICIES, f"policy must be one of {POLICIES}"
         assert self.fallback in FALLBACKS, f"fallback must be one of {FALLBACKS}"
         assert self.cpu_kernel in CPU_KERNELS, f"cpu_kernel must be one of {CPU_KERNELS}"
+        assert self.precision in PRECISIONS, f"precision must be one of {PRECISIONS}"
+        assert self.verify in ("first", "always", "off"), "verify must be first / always / off"
         assert all(b % 128 == 0 for b in self.row_buckets), "row buckets must be multiples of 128"
 
     def merged(self, options=None):

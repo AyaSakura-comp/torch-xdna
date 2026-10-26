@@ -62,19 +62,32 @@ def offload_gemms(gm: torch.fx.GraphModule, example_inputs, cfg) -> int:
     def is_weight(n):
         return isinstance(n, torch.fx.Node) and (n in static or n.op == "get_attr") and _weight_ok(n, attr)
 
+    def is_weight_vector(n):
+        """A 1-D parameter: a bias that broadcasts over the rows like F.linear's."""
+        t = n.meta.get("example_value") if isinstance(n, torch.fx.Node) else None
+        return (isinstance(n, torch.fx.Node) and (n in static or n.op == "get_attr")
+                and isinstance(t, torch.Tensor) and t.dim() == 1)
+
     cid = ops.config_id(cfg)
     count = 0
     for node in list(gm.graph.nodes):
-        if node.op != "call_function":
-            continue
-        if node.target in LINEAR:
+        if node.op == "call_function" and node.target in LINEAR:
             x = node.args[0] if node.args else node.kwargs.get("input")
             w = node.args[1] if len(node.args) > 1 else node.kwargs.get("weight")
             b = node.args[2] if len(node.args) > 2 else node.kwargs.get("bias")
             transposed = False
-        elif node.target in MATMUL and len(node.args) == 2:
-            x, w = node.args
+        elif ((node.op == "call_function" and node.target in MATMUL | {torch.mm})
+              or (node.op == "call_method" and node.target in ("matmul", "mm", "__matmul__"))) \
+                and len(node.args) == 2 and not node.kwargs:
+            x, w = node.args          # x @ W, W [K, N]
             b, transposed = None, True
+        elif node.op == "call_function" and node.target is torch.addmm and len(node.args) == 3 \
+                and all(node.kwargs.get(k, 1) == 1 for k in ("beta", "alpha")) \
+                and set(node.kwargs) <= {"beta", "alpha"}:
+            b, x, w = node.args       # bias + x @ W (HF Conv1D: GPT-2 and friends)
+            transposed = True
+            if not (b is None or is_weight_vector(b)):
+                continue
         else:
             continue
         if not is_weight(w):

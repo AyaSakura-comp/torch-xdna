@@ -17,6 +17,25 @@ L1 = {512: (64, 128), 256: (64, 128), 128: (32, 128)}
 CACHE = Path(os.environ.get("TORCH_XDNA_CACHE", Path.home() / ".cache" / "torch_xdna"))
 
 _lock = threading.RLock()
+_project = None
+
+
+def project_dir() -> str:
+    """This process's own AIR build directory (removed at exit).
+
+    Triton-XDNA builds in a project directory and caches what it finds there;
+    two processes building in one directory at once silently produce wrong
+    binaries (reproduced: 8 of 16 GEMMs wrong), so never share it.
+    """
+    global _project
+    if _project is None:
+        import atexit
+        import shutil
+
+        _project = str(CACHE / "air_project" / str(os.getpid()))
+        os.makedirs(_project, exist_ok=True)
+        atexit.register(shutil.rmtree, _project, True)
+    return _project
 _state = {"ok": None, "error": None}
 _mod = {}
 
@@ -67,7 +86,7 @@ def _load():
 
     CACHE.mkdir(parents=True, exist_ok=True)
     _mod.update(triton=triton, resident=resident, npu_config=npu_config,
-                driver=NPUDriver(), kernel=_triton_kernels.matmul_i8_k)
+                driver=NPUDriver(), kernel=_triton_kernels.matmul_i8_k, kernel_bf16=_triton_kernels.matmul_bf16_k)
 
 
 def resident():
@@ -130,21 +149,27 @@ def tiling_for(M: int, N: int, K: int) -> Tiling:
     return default_tiling(512 if M % 512 == 0 else (256 if M % 256 == 0 else 128))
 
 
-def schedule(t) -> str:
-    """The AIR tiling script for a tiling (generated once, cached on disk)."""
+def schedule(t, dtype="i8") -> str:
+    """The AIR tiling script for a tiling and input type ("i8" or "bf16"), generated once, cached on disk."""
     t = t if isinstance(t, Tiling) else default_tiling(t)
-    path = CACHE / f"transform_i8_k{t.l2_k}_{t.l1_m}x{t.l1_n}.mlir"
+    path = CACHE / f"transform_{dtype}_k{t.l2_k}_{t.l1_m}x{t.l1_n}.mlir"
     if not path.exists():
         from triton.backends.amd_triton_npu.matmul_transform import generate_matmul_transform
 
+        kw = dict(accum_type="i32") if dtype == "i8" else dict(accum_type="f32")
         tmp = path.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(generate_matmul_transform(l1_m=t.l1_m, l1_n=t.l1_n, l2_k=t.l2_k,
-                                                 pack_sizes=(8, 8, 8), accum_type="i32", k_loop=True))
+                                                 pack_sizes=(8, 8, 8), k_loop=True, **kw))
         tmp.replace(path)
     return str(path)
 
 
-def mm_i8(a, w, c, tiling, project=None):
+def mm_bf16(a, w, c, tiling, project=None):
+    """c[M, N] (f32) = a[M, K] @ w[K, N] (bf16) on the NPU; see mm_i8 for the layout rules."""
+    return mm_i8(a, w, c, tiling, project, dtype="bf16")
+
+
+def mm_i8(a, w, c, tiling, project=None, dtype="i8"):
     """c[M, N] = a[M, K] @ w[K, N] on the NPU; int8 in, int32 out, all resident.
 
     `tiling` is a Tiling or a row block (then the default tiling for it). M
@@ -158,10 +183,10 @@ def mm_i8(a, w, c, tiling, project=None):
     cfg = _mod["npu_config"]
     _mod["triton"].runtime.driver.set_active(_mod["driver"])  # per thread
     saved = (cfg._transform_tiling_script, cfg._air_project_path)
-    cfg._transform_tiling_script = schedule(t)
-    cfg._air_project_path = project or str(CACHE / "air_project")
+    cfg._transform_tiling_script = schedule(t, dtype)
+    cfg._air_project_path = project or project_dir()
     try:
-        _mod["kernel"][(M // t.block_m, N // t.block_n)](
+        _mod["kernel" if dtype == "i8" else "kernel_bf16"][(M // t.block_m, N // t.block_n)](
             a, w, c, N, K, BLOCK_M=t.block_m, BLOCK_N=t.block_n, BLOCK_K=t.l2_k)
     finally:
         cfg._transform_tiling_script, cfg._air_project_path = saved

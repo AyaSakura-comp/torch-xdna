@@ -36,7 +36,7 @@ class Stats:
         return dict(calls=dict(self.calls), seconds={k: round(v, 4) for k, v in self.seconds.items()},
                     gmacs={k: round(v / 1e9, 3) for k, v in self.macs.items()},
                     npu_launches=self.launches, fallbacks=list(self.fallbacks),
-                    decisions={f"{k[0]}x{k[1]}x{k[2]}": v for k, v in decisions.items()},
+                    decisions={"x".join(map(str, k)): v for k, v in decisions.items()},
                     npu_available=kernels.available(), npu_unavailable_reason=kernels.unavailable_reason())
 
 
@@ -63,7 +63,8 @@ class QWeight:
         self.w_kn = q.t().contiguous()                                  # [K, N] for torch._int_mm
         self.Kp = _round_up(self.K, kernels.BLOCK_K)
         self.Np = _round_up(self.N, kernels.BLOCK_N)
-        self._npu = None
+        self.w_fp = wf                                                  # [N, K] fp32 (a view when w is fp32)
+        self._npu = self._npu_bf16 = None
 
     def npu(self):
         """The static resident copy, made on first NPU use."""
@@ -72,6 +73,14 @@ class QWeight:
             wt[: self.K, : self.N] = self.w_kn
             self._npu = kernels.resident().to_npu(wt, static=True)
         return self._npu
+
+    def npu_bf16(self):
+        """bf16 [Kp, Np] resident copy for precision="bf16" (made on first use)."""
+        if self._npu_bf16 is None:
+            wt = torch.zeros((self.Kp, self.Np), dtype=torch.bfloat16)
+            wt[: self.K, : self.N] = self.w_fp.t()
+            self._npu_bf16 = kernels.resident().to_npu(wt, static=True)
+        return self._npu_bf16
 
 
 _weights = {}  # key -> (weakrefs to the source tensors, QWeight)
@@ -114,6 +123,21 @@ class _Staging:
         return cls.a[: M * Kp].view(M, Kp), cls.c[: M * Np].view(M, Np)
 
 
+class _StagingBF16:
+    """Resident bf16 activations / f32 results for precision="bf16" launches."""
+
+    a = c = None
+
+    @classmethod
+    def views(cls, M, Kp, Np):
+        res = kernels.resident()
+        if cls.a is None or cls.a.numel() < M * Kp:
+            cls.a = res.empty(max(M * Kp, 1 << 20), dtype=torch.bfloat16)
+        if cls.c is None or cls.c.numel() < M * Np:
+            cls.c = res.empty(max(M * Np, 1 << 20), dtype=torch.float32)
+        return cls.a[: M * Kp].view(M, Kp), cls.c[: M * Np].view(M, Np)
+
+
 # ------------------------------------------------------------------ the two devices
 def _quant_rows(x2d):
     x = x2d.float()
@@ -136,6 +160,31 @@ def _cpu_acc(xq, qw):
     return torch._int_mm(xq, qw.w_kn)
 
 
+_verified = {}  # (dtype, rows, Np, Kp, tiling) -> True once a launch of that NPU program matched the CPU
+VERIFY = "first"  # set from Config.verify by linear(): "first" | "always" | "off"
+
+
+class NPUResultMismatch(RuntimeError):
+    """An NPU program returned something the CPU disagrees with (e.g. a silent miscompile)."""
+
+
+def _check(key, got, want, exact):
+    """Compare one launch's rows with the CPU unless this program was already verified."""
+    if VERIFY == "off" or (VERIFY == "first" and _verified.get(key)):
+        return
+    want = want()
+    if exact:
+        ok = torch.equal(got, want)
+        detail = f"{(got != want).sum().item()} of {got.numel()} values differ"
+    else:
+        err = ((got - want).norm() / want.norm().clamp(min=1e-30)).item()
+        ok = bool(torch.isfinite(got).all()) and err < 5e-2
+        detail = f"rel err {err:.3g}, non-finite {(~torch.isfinite(got)).sum().item()}"
+    if not ok:
+        raise NPUResultMismatch(f"NPU program {key} disagrees with the CPU: {detail}")
+    _verified[key] = True
+
+
 def _npu_acc(xq, qw, buckets, tuned=True):
     """int32 [R, N] from the NPU, as launches of at most the largest bucket's rows."""
     R = xq.shape[0]
@@ -149,8 +198,38 @@ def _npu_acc(xq, qw, buckets, tuned=True):
         a[:r, : qw.K].copy_(xq[r0: r0 + r])
         if qw.Kp != qw.K:
             a[:r, qw.K:].zero_()
-        kernels.mm_i8(a, w, c, kernels.tiling_for(M, qw.Np, qw.Kp) if tuned else _block_m(M))
+        t = kernels.tiling_for(M, qw.Np, qw.Kp) if tuned else kernels.default_tiling(_block_m(M))
+        kernels.mm_i8(a, w, c, t)
         stats.launches += 1
+        _check(("i8", M, qw.Np, qw.Kp, str(t)), c[:r, : qw.N], lambda: torch._int_mm(xq[r0: r0 + r], qw.w_kn), True)
+        out[r0: r0 + r].copy_(c[:r, : qw.N])
+    return out
+
+
+def _bf16_tiling(M):
+    """bf16 runs as bfp16 MACs on AIE2P; K steps of 64 (its L1 tile is twice an int8 one)."""
+    # 128-row blocks step K by 128: with 64, (K=768, N=50688) silently miscompiles (mlir-air), see README
+    return kernels.Tiling(128, 512, 32, 128, 128) if M % 256 else kernels.Tiling(256, 512, 64, 128, 64)
+
+
+def _npu_bf16(x2d, qw, buckets):
+    """f32 [R, N] = x @ W on the NPU in bf16 (bfp16 MACs, f32 accumulate)."""
+    R = x2d.shape[0]
+    out = torch.empty((R, qw.N), dtype=torch.float32)
+    w = qw.npu_bf16()
+    top = buckets[-1]
+    for r0 in range(0, R, top):
+        r = min(top, R - r0)
+        M = _bucket(r, buckets)
+        a, c = _StagingBF16.views(M, qw.Kp, qw.Np)
+        a[:r, : qw.K].copy_(x2d[r0: r0 + r])
+        if qw.Kp != qw.K:
+            a[:r, qw.K:].zero_()
+        t = _bf16_tiling(M)
+        kernels.mm_bf16(a, w, c, t)
+        stats.launches += 1
+        _check(("bf16", M, qw.Np, qw.Kp, str(t)), c[:r, : qw.N],
+               lambda: a[:r, : qw.K].float() @ qw.w_fp.t().bfloat16().float(), False)
         out[r0: r0 + r].copy_(c[:r, : qw.N])
     return out
 
@@ -165,22 +244,20 @@ def _time(fn, reps=3):
     return best * 1e3
 
 
-def _choose(cfg, xq, qw):
-    """'npu' or 'cpu' for this call."""
-    R = xq.shape[0]
+def _choose(cfg, R, qw, npu_fn, cpu_fn):
+    """'npu' or 'cpu' for a call of R rows; npu_fn / cpu_fn run it on either (for autotune)."""
     if cfg.policy == "cpu" or R < cfg.min_rows or R * qw.N * qw.K < cfg.min_macs:
         return "cpu"
     if not kernels.available():
         return "cpu"
-    if cfg.policy == "npu":
-        return "cpu" if (_bucket(R, cfg.row_buckets), qw.N, qw.K) in _failed else "npu"
-    key = (_bucket(R, cfg.row_buckets), qw.N, qw.K)
+    key = (cfg.precision, _bucket(R, cfg.row_buckets), qw.N, qw.K)
     if key in _failed:
         return "cpu"
+    if cfg.policy == "npu":
+        return "npu"
     hit = decisions.get(key)
     if hit is None:
-        npu_ms = _time(lambda: _npu_acc(xq, qw, cfg.row_buckets, cfg.tuned_tilings))
-        cpu_ms = _time(lambda: _cpu_acc(xq, qw))
+        npu_ms, cpu_ms = _time(npu_fn), _time(cpu_fn)
         hit = ("npu" if npu_ms < cpu_ms else "cpu", round(npu_ms, 3), round(cpu_ms, 3))
         decisions[key] = hit
         if cfg.verbose:
@@ -192,23 +269,45 @@ _failed = set()          # (bucket, N, K) whose NPU launch raised: CPU from then
 MAX_NPU_FAILURES = 3     # distinct failing shapes before the NPU is retired for the process
 
 
+def _npu_failed(cfg, R, qw, e):
+    shape = (cfg.precision, _bucket(R, cfg.row_buckets), qw.N, qw.K)
+    _failed.add(shape)
+    stats.fallbacks.append((shape, f"{type(e).__name__}: {e}"[:300]))
+    log.warning("torch_xdna: NPU GEMM %s failed (%s); it runs on the CPU from now on", shape, e)
+    if len(_failed) >= MAX_NPU_FAILURES:
+        kernels.mark_broken(e)
+        log.warning("torch_xdna: %d NPU failures, NPU retired for this process", len(_failed))
+
+
 def _gemm(cfg, x2d, qw):
-    """int32 accumulators [R, N], activation scales [R], and the device that ran it."""
+    """precision int8: int32 accumulators [R, N], activation scales [R], and the device that ran it."""
     xq, sx = _quant_rows(x2d)
     with _lock:
-        device = _choose(cfg, xq, qw)
+        device = _choose(cfg, xq.shape[0], qw, lambda: _npu_acc(xq, qw, cfg.row_buckets, cfg.tuned_tilings),
+                         lambda: _cpu_acc(xq, qw))
         if device == "npu":
             try:
                 return _npu_acc(xq, qw, cfg.row_buckets, cfg.tuned_tilings), sx, "npu"
             except Exception as e:  # compile / context / launch failure: this shape moves to the CPU
-                shape = (_bucket(xq.shape[0], cfg.row_buckets), qw.N, qw.K)
-                _failed.add(shape)
-                stats.fallbacks.append((shape, f"{type(e).__name__}: {e}"[:300]))
-                log.warning("torch_xdna: NPU GEMM %s failed (%s); it runs on the CPU from now on", shape, e)
-                if len(_failed) >= MAX_NPU_FAILURES:
-                    kernels.mark_broken(e)
-                    log.warning("torch_xdna: %d NPU failures, NPU retired for this process", len(_failed))
+                _npu_failed(cfg, xq.shape[0], qw, e)
         return _cpu_acc(xq, qw), sx, "cpu"
+
+
+def _gemm_bf16(cfg, x2d, qw):
+    """precision bf16: f32 [R, N] = x @ W (no bias), and the device that ran it.
+
+    The NPU computes in bfp16 (AIE2P's MAC format: 8 values share an exponent); the
+    CPU route is the fp32 GEMM, so here the devices agree to ~1e-2, not bit for bit.
+    """
+    with _lock:
+        device = _choose(cfg, x2d.shape[0], qw, lambda: _npu_bf16(x2d, qw, cfg.row_buckets),
+                         lambda: x2d.float() @ qw.w_fp.t())
+        if device == "npu":
+            try:
+                return _npu_bf16(x2d, qw, cfg.row_buckets), "npu"
+            except Exception as e:
+                _npu_failed(cfg, x2d.shape[0], qw, e)
+        return x2d.float() @ qw.w_fp.t(), "cpu"
 
 
 def _account(device, t0, rows, qw):
@@ -223,6 +322,8 @@ def _fp_only(cfg):
 
 def linear(cfg, x, weight, bias, transposed):
     """y = x @ W^T + b (or x @ W when transposed) with W8A8 math on the chosen device."""
+    global VERIFY
+    VERIFY = cfg.verify
     shape = x.shape[:-1]
     x2d = x.reshape(-1, x.shape[-1])
     N = weight.shape[1] if transposed else weight.shape[0]
@@ -233,6 +334,12 @@ def linear(cfg, x, weight, bias, transposed):
         return torch.nn.functional.linear(x, w_fp.to(x.dtype), bias)
     t0 = time.perf_counter()
     qw = qweight(weight, transposed)
+    if cfg.precision == "bf16":
+        y, device = _gemm_bf16(cfg, x2d, qw)
+        if bias is not None:
+            y += bias.float()
+        _account(device, t0, x2d.shape[0], qw)
+        return y.to(x.dtype).reshape(*shape, N)
     acc, sx, device = _gemm(cfg, x2d, qw)
     if device == "cpu" and cfg.cpu_kernel == "fp":
         y = torch.nn.functional.linear(x2d, w_fp.to(x.dtype), bias)
@@ -247,6 +354,8 @@ def linear(cfg, x, weight, bias, transposed):
 
 def linear_cat(cfg, x, weights, biases):
     """torch.cat([F.linear(x, w, b) for w, b in zip(weights, biases)], -1) as one W8A8 GEMM."""
+    global VERIFY
+    VERIFY = cfg.verify
     shape = x.shape[:-1]
     x2d = x.reshape(-1, x.shape[-1])
     N = sum(w.shape[0] for w in weights)
@@ -260,6 +369,12 @@ def linear_cat(cfg, x, weights, biases):
         return torch.nn.functional.linear(x, torch.cat(list(weights)).to(x.dtype), bias)
     t0 = time.perf_counter()
     qw = qweight(list(weights))
+    if cfg.precision == "bf16":
+        y, device = _gemm_bf16(cfg, x2d, qw)
+        if bias is not None:
+            y += bias.float()
+        _account(device, t0, x2d.shape[0], qw)
+        return y.to(x.dtype).reshape(*shape, N)
     acc, sx, device = _gemm(cfg, x2d, qw)
     if device == "cpu" and cfg.cpu_kernel == "fp":
         y = torch.nn.functional.linear(x2d, torch.cat(list(weights)).to(x.dtype), bias)

@@ -127,6 +127,33 @@ def case_fusion():
     print(msg)
 
 
+def case_silent_wrong():
+    """An NPU program that runs but returns a wrong value (a silent miscompile) is caught on its
+    first launch; that shape moves to the CPU and the model's output is still right."""
+    if not torch_xdna.npu_available():
+        print("SKIP silent wrong: no NPU")
+        return
+    from torch_xdna import kernels
+
+    real = kernels.mm_i8
+
+    def corrupt(a, w, c, t, *args, **kw):
+        real(a, w, c, t, *args, **kw)
+        if w.shape[1] == 512:          # only self.a (N=300, padded to 512)
+            c[0, 0] += 1
+
+    kernels.mm_i8 = corrupt
+    net = Net().eval()
+    x = torch.randn(300, 200)
+    y = run(net, x, policy="npu")
+    s = runtime.stats.as_dict()
+    y_cpu = run(net, x, policy="cpu")
+    assert torch.equal(y, y_cpu), "wrong NPU value reached the output"
+    assert len(s["fallbacks"]) == 1 and "disagrees with the CPU" in s["fallbacks"][0][1], s["fallbacks"]
+    assert s["calls"] == {"npu": 2, "cpu": 1}, s["calls"]
+    print("PASS silent wrong ->", s["fallbacks"][0][1][:90], "...; that GEMM on the CPU, output bitwise == cpu-int8")
+
+
 def case_launch_failure():
     """An NPU launch that raises: the call still returns the right answer, on the CPU, and the NPU is retired."""
     if not torch_xdna.npu_available():
@@ -163,7 +190,7 @@ def case_no_npu():
     print(f"PASS no NPU: cpu int8 rel err {e_int8:.4f}, cpu fp rel err {e_fp:.2e}")
 
 
-CASES = {f.__name__[5:]: f for f in (case_numerics, case_split_and_eager, case_auto, case_fusion,
+CASES = {f.__name__[5:]: f for f in (case_numerics, case_split_and_eager, case_auto, case_fusion, case_silent_wrong,
                                       case_launch_failure, case_no_npu)}
 
 if __name__ == "__main__":
