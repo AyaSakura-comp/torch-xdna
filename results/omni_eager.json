@@ -1,0 +1,61 @@
+{
+ "mode": "eager-fp32",
+ "warmup_s": 9.206225032918155,
+ "rows": [
+  {
+   "mode": "eager-fp32",
+   "text": "short",
+   "steps": 8,
+   "median_s": 1.475,
+   "audio_s": 1.77,
+   "rtf": 0.833,
+   "all_s": [
+    1.509,
+    1.462,
+    1.475
+   ],
+   "gemm_calls_per_rep": {},
+   "npu_launches_per_rep": 0
+  },
+  {
+   "mode": "eager-fp32",
+   "text": "mid",
+   "steps": 8,
+   "median_s": 2.539,
+   "audio_s": 3.82,
+   "rtf": 0.665,
+   "all_s": [
+    2.539,
+    2.559,
+    2.376
+   ],
+   "gemm_calls_per_rep": {},
+   "npu_launches_per_rep": 0
+  },
+  {
+   "mode": "eager-fp32",
+   "text": "long",
+   "steps": 8,
+   "median_s": 4.911,
+   "audio_s": 8.25,
+   "rtf": 0.595,
+   "all_s": [
+    4.709,
+    5.097,
+    4.911
+   ],
+   "gemm_calls_per_rep": {},
+   "npu_launches_per_rep": 0
+  }
+ ],
+ "stats": {
+  "calls": {},
+  "seconds": {},
+  "gmacs": {},
+  "npu_launches": 0,
+  "fallbacks": [],
+  "decisions": {},
+  "npu_available": true,
+  "npu_unavailable_reason": null
+ }
+}

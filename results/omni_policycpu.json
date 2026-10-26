@@ -1,0 +1,73 @@
+{
+ "mode": "xdna-cpu-inductor",
+ "warmup_s": 26.716579014901072,
+ "rows": [
+  {
+   "mode": "xdna-cpu-inductor",
+   "text": "short",
+   "steps": 8,
+   "median_s": 0.453,
+   "audio_s": 1.91,
+   "rtf": 0.237,
+   "all_s": [
+    0.435,
+    0.453,
+    0.484
+   ],
+   "gemm_calls_per_rep": {
+    "cpu": 904
+   },
+   "npu_launches_per_rep": 0
+  },
+  {
+   "mode": "xdna-cpu-inductor",
+   "text": "mid",
+   "steps": 8,
+   "median_s": 0.713,
+   "audio_s": 3.88,
+   "rtf": 0.184,
+   "all_s": [
+    0.721,
+    0.713,
+    0.683
+   ],
+   "gemm_calls_per_rep": {
+    "cpu": 904
+   },
+   "npu_launches_per_rep": 0
+  },
+  {
+   "mode": "xdna-cpu-inductor",
+   "text": "long",
+   "steps": 8,
+   "median_s": 1.789,
+   "audio_s": 8.66,
+   "rtf": 0.207,
+   "all_s": [
+    1.844,
+    1.789,
+    1.716
+   ],
+   "gemm_calls_per_rep": {
+    "cpu": 904
+   },
+   "npu_launches_per_rep": 0
+  }
+ ],
+ "stats": {
+  "calls": {
+   "cpu": 2712
+  },
+  "seconds": {
+   "cpu": 3.1392
+  },
+  "gmacs": {
+   "cpu": 5687.177
+  },
+  "npu_launches": 0,
+  "fallbacks": [],
+  "decisions": {},
+  "npu_available": true,
+  "npu_unavailable_reason": null
+ }
+}

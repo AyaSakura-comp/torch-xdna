@@ -1,0 +1,56 @@
+start load=3.85 at 13:16:04
+=== --policy npu
+xdna-npu-inductor: warmup (compile + NPU builds) 16.8s
+{"mode": "xdna-npu-inductor", "text": "short", "steps": 8, "median_s": 0.92, "audio_s": 1.77, "rtf": 0.52, "all_s": [0.895, 0.92, 0.921], "gemm_calls_per_rep": {"npu": 904}, "npu_launches_per_rep": 904}
+{"mode": "xdna-npu-inductor", "text": "mid", "steps": 8, "median_s": 1.16, "audio_s": 3.88, "rtf": 0.299, "all_s": [1.157, 1.161, 1.16], "gemm_calls_per_rep": {"npu": 904}, "npu_launches_per_rep": 904}
+{"mode": "xdna-npu-inductor", "text": "long", "steps": 8, "median_s": 2.596, "audio_s": 8.75, "rtf": 0.297, "all_s": [2.55, 2.636, 2.596], "gemm_calls_per_rep": {"npu": 904}, "npu_launches_per_rep": 904}
+NPU available: True
+  npu : 2712 GEMMs, 5687.177 GMAC, 5.6888 s
+  NPU launches: 2712
+=== --policy auto
+xdna-auto-inductor: warmup (compile + NPU builds) 13.7s
+{"mode": "xdna-auto-inductor", "text": "short", "steps": 8, "median_s": 0.395, "audio_s": 1.81, "rtf": 0.218, "all_s": [0.398, 0.395, 0.393], "gemm_calls_per_rep": {"cpu": 904}, "npu_launches_per_rep": 0}
+{"mode": "xdna-auto-inductor", "text": "mid", "steps": 8, "median_s": 0.658, "audio_s": 3.88, "rtf": 0.17, "all_s": [0.658, 0.625, 0.662], "gemm_calls_per_rep": {"cpu": 904}, "npu_launches_per_rep": 0}
+{"mode": "xdna-auto-inductor", "text": "long", "steps": 8, "median_s": 1.699, "audio_s": 8.57, "rtf": 0.198, "all_s": [1.67, 1.72, 1.699], "gemm_calls_per_rep": {"cpu": 904}, "npu_launches_per_rep": 0}
+NPU available: True
+  cpu : 2712 GEMMs, 5687.177 GMAC, 3.201 s
+  NPU launches: 0
+  auto 128x4096x1024: cpu (npu 0.707 ms, cpu 0.138 ms)
+  auto 128x1024x2048: cpu (npu 0.477 ms, cpu 0.076 ms)
+  auto 128x6144x1024: cpu (npu 0.891 ms, cpu 0.179 ms)
+  auto 128x1024x3072: cpu (npu 0.527 ms, cpu 0.11 ms)
+  auto 128x8200x1024: cpu (npu 1.129 ms, cpu 0.247 ms)
+  auto 256x4096x1024: cpu (npu 0.863 ms, cpu 0.225 ms)
+  auto 256x1024x2048: cpu (npu 0.568 ms, cpu 0.13 ms)
+  auto 256x6144x1024: cpu (npu 0.936 ms, cpu 0.18 ms)
+  auto 256x1024x3072: cpu (npu 0.589 ms, cpu 0.119 ms)
+  auto 256x8200x1024: cpu (npu 1.496 ms, cpu 0.258 ms)
+  auto 1024x4096x1024: cpu (npu 1.513 ms, cpu 0.559 ms)
+  auto 1024x1024x2048: cpu (npu 0.892 ms, cpu 0.27 ms)
+  auto 1024x6144x1024: cpu (npu 2.074 ms, cpu 0.751 ms)
+  auto 1024x1024x3072: cpu (npu 0.984 ms, cpu 0.442 ms)
+  auto 1024x8200x1024: cpu (npu 3.26 ms, cpu 1.053 ms)
+=== --policy cpu
+xdna-cpu-inductor: warmup (compile + NPU builds) 26.7s
+{"mode": "xdna-cpu-inductor", "text": "short", "steps": 8, "median_s": 0.453, "audio_s": 1.91, "rtf": 0.237, "all_s": [0.435, 0.453, 0.484], "gemm_calls_per_rep": {"cpu": 904}, "npu_launches_per_rep": 0}
+{"mode": "xdna-cpu-inductor", "text": "mid", "steps": 8, "median_s": 0.713, "audio_s": 3.88, "rtf": 0.184, "all_s": [0.721, 0.713, 0.683], "gemm_calls_per_rep": {"cpu": 904}, "npu_launches_per_rep": 0}
+{"mode": "xdna-cpu-inductor", "text": "long", "steps": 8, "median_s": 1.789, "audio_s": 8.66, "rtf": 0.207, "all_s": [1.844, 1.789, 1.716], "gemm_calls_per_rep": {"cpu": 904}, "npu_launches_per_rep": 0}
+NPU available: True
+  cpu : 2712 GEMMs, 5687.177 GMAC, 3.1392 s
+  NPU launches: 0
+=== --policy npu --fallback eager
+xdna-npu-eager: warmup (compile + NPU builds) 15.7s
+{"mode": "xdna-npu-eager", "text": "short", "steps": 8, "median_s": 1.014, "audio_s": 1.74, "rtf": 0.582, "all_s": [1.014, 1.009, 1.026], "gemm_calls_per_rep": {"npu": 904}, "npu_launches_per_rep": 904}
+{"mode": "xdna-npu-eager", "text": "mid", "steps": 8, "median_s": 1.428, "audio_s": 3.88, "rtf": 0.368, "all_s": [1.345, 1.428, 1.467], "gemm_calls_per_rep": {"npu": 904}, "npu_launches_per_rep": 904}
+{"mode": "xdna-npu-eager", "text": "long", "steps": 8, "median_s": 2.891, "audio_s": 8.39, "rtf": 0.345, "all_s": [2.891, 2.977, 2.845], "gemm_calls_per_rep": {"npu": 904}, "npu_launches_per_rep": 904}
+NPU available: True
+  npu : 2712 GEMMs, 5687.177 GMAC, 5.921 s
+  NPU launches: 2712
+=== --eager
+eager-fp32: warmup (compile + NPU builds) 9.2s
+{"mode": "eager-fp32", "text": "short", "steps": 8, "median_s": 1.475, "audio_s": 1.77, "rtf": 0.833, "all_s": [1.509, 1.462, 1.475], "gemm_calls_per_rep": {}, "npu_launches_per_rep": 0}
+{"mode": "eager-fp32", "text": "mid", "steps": 8, "median_s": 2.539, "audio_s": 3.82, "rtf": 0.665, "all_s": [2.539, 2.559, 2.376], "gemm_calls_per_rep": {}, "npu_launches_per_rep": 0}
+{"mode": "eager-fp32", "text": "long", "steps": 8, "median_s": 4.911, "audio_s": 8.25, "rtf": 0.595, "all_s": [4.709, 5.097, 4.911], "gemm_calls_per_rep": {}, "npu_launches_per_rep": 0}
+NPU available: True
+  NPU launches: 0
+end load=17.47 at 13:19:11

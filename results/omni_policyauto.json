@@ -1,0 +1,149 @@
+{
+ "mode": "xdna-auto-inductor",
+ "warmup_s": 13.704943803139031,
+ "rows": [
+  {
+   "mode": "xdna-auto-inductor",
+   "text": "short",
+   "steps": 8,
+   "median_s": 0.395,
+   "audio_s": 1.81,
+   "rtf": 0.218,
+   "all_s": [
+    0.398,
+    0.395,
+    0.393
+   ],
+   "gemm_calls_per_rep": {
+    "cpu": 904
+   },
+   "npu_launches_per_rep": 0
+  },
+  {
+   "mode": "xdna-auto-inductor",
+   "text": "mid",
+   "steps": 8,
+   "median_s": 0.658,
+   "audio_s": 3.88,
+   "rtf": 0.17,
+   "all_s": [
+    0.658,
+    0.625,
+    0.662
+   ],
+   "gemm_calls_per_rep": {
+    "cpu": 904
+   },
+   "npu_launches_per_rep": 0
+  },
+  {
+   "mode": "xdna-auto-inductor",
+   "text": "long",
+   "steps": 8,
+   "median_s": 1.699,
+   "audio_s": 8.57,
+   "rtf": 0.198,
+   "all_s": [
+    1.67,
+    1.72,
+    1.699
+   ],
+   "gemm_calls_per_rep": {
+    "cpu": 904
+   },
+   "npu_launches_per_rep": 0
+  }
+ ],
+ "stats": {
+  "calls": {
+   "cpu": 2712
+  },
+  "seconds": {
+   "cpu": 3.201
+  },
+  "gmacs": {
+   "cpu": 5687.177
+  },
+  "npu_launches": 0,
+  "fallbacks": [],
+  "decisions": {
+   "128x4096x1024": [
+    "cpu",
+    0.707,
+    0.138
+   ],
+   "128x1024x2048": [
+    "cpu",
+    0.477,
+    0.076
+   ],
+   "128x6144x1024": [
+    "cpu",
+    0.891,
+    0.179
+   ],
+   "128x1024x3072": [
+    "cpu",
+    0.527,
+    0.11
+   ],
+   "128x8200x1024": [
+    "cpu",
+    1.129,
+    0.247
+   ],
+   "256x4096x1024": [
+    "cpu",
+    0.863,
+    0.225
+   ],
+   "256x1024x2048": [
+    "cpu",
+    0.568,
+    0.13
+   ],
+   "256x6144x1024": [
+    "cpu",
+    0.936,
+    0.18
+   ],
+   "256x1024x3072": [
+    "cpu",
+    0.589,
+    0.119
+   ],
+   "256x8200x1024": [
+    "cpu",
+    1.496,
+    0.258
+   ],
+   "1024x4096x1024": [
+    "cpu",
+    1.513,
+    0.559
+   ],
+   "1024x1024x2048": [
+    "cpu",
+    0.892,
+    0.27
+   ],
+   "1024x6144x1024": [
+    "cpu",
+    2.074,
+    0.751
+   ],
+   "1024x1024x3072": [
+    "cpu",
+    0.984,
+    0.442
+   ],
+   "1024x8200x1024": [
+    "cpu",
+    3.26,
+    1.053
+   ]
+  },
+  "npu_available": true,
+  "npu_unavailable_reason": null
+ }
+}
