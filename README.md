@@ -55,10 +55,11 @@ xdna::linear at run time (runtime.py)
 ## 3x3 convolutions: the cascade op
 
 `xdna::conv3x3` runs Triton-XDNA's `tl.extra.npu.conv3x3` (branch `feat/npu-conv3x3`): every
-core keeps its weights for the whole image, the input channels are split over two vertically
-adjacent cores whose partial sums meet over the AIE cascade, and the tail core requantizes
-(shift, round, saturate; ReLU as unsigned saturation). 16 such chains fill the array. How it was
-built, measured and traced: [results/conv3x3_cascade.md](results/conv3x3_cascade.md).
+core keeps its weights for the whole image, the input channels are split over a chain of 2 or 4
+vertically adjacent cores whose partial sums meet over the AIE cascade, and the tail core
+requantizes (shift, round, saturate; ReLU as unsigned saturation). The chains fill the array,
+split over output channels, image strips and (for small Co) image partitions. How it was built,
+measured and traced: [results/conv3x3_cascade.md](results/conv3x3_cascade.md).
 
 | Ci = Co = 256 | NPU time | int8 TOPS |
 |---|---|---|
@@ -71,10 +72,12 @@ per-channel scale) -> dequantize (+ bias); the quantize and dequantize are ordin
 Inductor fuses with their neighbours. Weights are int8 per output channel, the shift is fixed on
 a layer's first call (25% headroom over its integer sums), and the CPU route computes the same
 integers, so the first NPU launch of every layer is checked bit for bit. Taken: 3x3, stride 1,
-padding 1 or `"same"`, groups 1, Ci 16..256 in steps of 16, Co a multiple of 32, W a multiple of
-64 (so ResNet-50 at 224x224, with 56/28/14/7-wide maps, gets none). Without an NPU, or with
-`policy="cpu"`, convs are left as they are (int8 has no CPU conv kernel to gain from); a layer
-whose NPU launch fails at run time computes the same integers on the CPU.
+padding 1 or `"same"`, groups 1, up to 512 input channels; any Co, H and W (the op pads channels
+and tiles the image), a batch in one launch. Without an NPU, or with `policy="cpu"`, convs are
+left as they are (int8 has no CPU conv kernel to gain from); a layer whose NPU launch fails at
+run time computes the same integers on the CPU. After the first pass all NPU convs of different
+geometry are merged into one hardware context (`tl.extra.npu.conv3x3.share_context`): two
+separate contexts cost ~2.3 ms per switch, a shared one ~0.4 ms of reconfiguration per launch.
 
 `examples/conv_xdna.py`, four bias-free 3x3 convs + ReLU, 256 channels, 1 x 64 x 64, median of
 10 (the same run, machine otherwise lightly loaded):
@@ -88,6 +91,28 @@ whose NPU launch fails at run time computes the same integers on the CPU.
 The rest of the end-to-end time is the host: quantize / dequantize (Inductor), the int8 layout
 change around each launch, and ~0.1 ms per launch. Under heavier CPU load the fp32 CPU run took
 11.7 ms and the NPU run 2.0 ms.
+
+## Results: whole CNNs
+
+`examples/vgg16_xdna.py`: torchvision VGG-16 (ImageNet weights), `policy="npu"`, `min_rows=1`,
+`min_macs=0`, 224x224, public-domain test images (scikit-image / matplotlib sample data):
+
+| VGG-16 | |
+|---|---|
+| on the NPU | **100% of conv + linear MACs** (13 convs as `xdna::conv3x3`, 3 linears as `xdna::linear`); ReLU, max-pool and the int8 quantize / dequantize stay on the CPU |
+| vs fp32 eager, 8 images | top-1 7/8 (the 8th: "bow tie" vs "suit"), top-5 overlap 92%, logits cosine >= 0.991 |
+| batch 1 | NPU 19.7-20.0 ms vs Inductor fp32 32.2 ms |
+| batch 8 | NPU 68.5-69.7 ms vs Inductor fp32 142-162 ms |
+
+Where batch 1's 20 ms go: 13 conv launches 8.5 ms (each mostly the ~0.45 ms reconfiguration;
+the MACs themselves are ~0.7 ms at 45 TOPS), their host layouts 2 ms, the 3 linears 7.8 ms
+(the first streams 103 MB of int8 weights per call), the rest 1.9 ms. At batch 8 the CPU's fp32
+work between the NPU ops (quantize / dequantize, ReLU, pooling of up to 100 MB activations)
+grows to ~28 ms and is the largest part.
+
+ResNet-50 (same images): its 13 3x3 stride-1 convs reach the NPU (36.8% of conv MACs, top-1 8/8);
+the 1x1 convs (52% of the MACs), the stride-2 convs and the 7x7 stem have no NPU kernel yet, and
+at batch 1 the split run (18.4 ms) is slower than Inductor fp32 alone (10.3 ms).
 
 ## Precision, and how wrong answers are kept out
 

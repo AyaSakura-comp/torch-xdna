@@ -265,6 +265,41 @@ def case_conv():
           f"rel err vs fp32 {e:.4f}")
 
 
+class OddCNN(torch.nn.Module):
+    """Shapes the NPU op pads: Ci 3, Co 48, a 13 x 37 image, batch 2."""
+
+    def __init__(self):
+        super().__init__()
+        self.c1 = torch.nn.Conv2d(3, 64, 3, padding=1)
+        self.c2 = torch.nn.Conv2d(64, 48, 3, padding=1, bias=False)
+
+    def forward(self, x):
+        return torch.relu(self.c2(torch.relu(self.c1(x))))
+
+
+def case_conv_odd():
+    """Padded channels and any H x W: NPU == the CPU's integers, close to fp32."""
+    if not torch_xdna.npu_available():
+        print("SKIP conv odd: no NPU")
+        return
+    from torch_xdna import conv as xconv
+
+    net = OddCNN().eval()
+    x = torch.randn(2, 3, 13, 37)
+    with torch.no_grad():
+        ref = net(x)
+    y = run(net, x, policy="npu")
+    s = runtime.stats.as_dict()
+    assert s["calls"] == {"npu": 2} and not s["fallbacks"], s
+    for _, layer in xconv._layers.values():
+        layer.device = "cpu"
+    y_cpu = run(net, x, policy="npu")
+    assert torch.equal(y, y_cpu), "NPU and CPU integers differ"
+    e = rel_err(y, ref)
+    assert e < 0.05, e
+    print(f"PASS conv odd: 3->64->48 on 2x13x37, == the CPU's integers, rel err vs fp32 {e:.4f}")
+
+
 def case_conv_silent_wrong():
     """A conv launch returning one wrong value is caught on the layer's first launch; that layer
     moves to the CPU (fp conv) and the model's output is still right."""
@@ -297,7 +332,7 @@ def case_conv_silent_wrong():
 
 CASES = {f.__name__[5:]: f for f in (case_numerics, case_split_and_eager, case_auto, case_fusion, case_silent_wrong,
                                       case_launch_failure, case_no_npu, case_conv_pass, case_conv,
-                                      case_conv_silent_wrong)}
+                                      case_conv_odd, case_conv_silent_wrong)}
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

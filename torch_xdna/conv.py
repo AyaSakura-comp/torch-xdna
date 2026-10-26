@@ -19,6 +19,7 @@ that disagrees, fails to build or launch, or (policy "auto") is slower stays on 
 
 import logging
 import math
+import os
 import threading
 import time
 import weakref
@@ -31,11 +32,12 @@ from .runtime import NPUResultMismatch, _time, decisions, stats
 log = logging.getLogger("torch_xdna")
 _lock = threading.RLock()
 _layers = {}            # (id(weight), H, W, relu) -> (weakref to weight, ConvLayer)
+_shared = set()         # ids of the NPU ops in the current shared hardware context
 
 
 def supported(ci, co, h, w):
-    """Shapes tl.extra.npu.conv3x3 takes: Ci 16..256 in 16s, Co in 32s, W in 64-pixel bands."""
-    return ci % 16 == 0 and 16 <= ci <= 256 and co % 32 == 0 and w % 64 == 0 and h >= 1
+    """Shapes tl.extra.npu.conv3x3 takes: up to 512 input channels (it pads channels and tiles any H x W)."""
+    return 1 <= ci <= 512 and co >= 1 and h >= 1 and w >= 1
 
 
 def conv3x3_int8(x, weight, bias, relu: bool, cfg_id: int):
@@ -60,7 +62,8 @@ class ConvLayer:
         self.cpu_dtype = (torch.float32 if 127 * float(self.wq.abs().sum(dim=(1, 2, 3)).max()) < 2 ** 24
                           else torch.float64)
         self.h, self.w, self.relu = h, w, relu
-        self.shift = self.scale = self.op = None
+        self.shift = self.scale = None
+        self.ops = {}           # batch size -> tl.extra.npu.conv3x3 op (one launch for the batch)
         self.device = None      # "npu" or "cpu" once the first call has decided
         co, ci = weight.shape[:2]
         self.name = f"conv3x3 {ci}->{co} {h}x{w}" + (" relu" if relu else "")
@@ -72,10 +75,13 @@ class ConvLayer:
         self.shift = min(31, max(1, math.ceil(math.log2(max(top * 1.25, 1.0) / (255 if self.relu else 127)))))
         self.scale = self.sw * 2.0 ** self.shift
 
-    def build(self):
-        from triton.language.extra.npu import conv3x3
+    def op(self, n):
+        if n not in self.ops:
+            from triton.language.extra.npu import conv3x3
 
-        self.op = conv3x3.Conv3x3(self.wq, height=self.h, width=self.w, shift=self.shift, relu=self.relu)
+            self.ops[n] = conv3x3.Conv3x3(self.wq, height=self.h, width=self.w, shift=self.shift,
+                                          relu=self.relu, batch=n)
+        return self.ops[n]
 
     def _acc(self, xq):
         return torch.nn.functional.conv2d(xq.to(self.cpu_dtype), self.wq.to(self.cpu_dtype), padding=1)
@@ -86,16 +92,14 @@ class ConvLayer:
         return q.clamp_(0, 255).to(torch.uint8) if self.relu else q.clamp_(-128, 127).to(torch.int8)
 
     def npu(self, xq, verify=False):
-        out = torch.empty((xq.shape[0], self.wq.shape[0], self.h, self.w),
-                          dtype=torch.uint8 if self.relu else torch.int8)
-        for i in range(xq.shape[0]):
-            self.op(xq[i], out=out[i])
-            if verify:
-                want = self.cpu(xq[i:i + 1])[0]
-                if not torch.equal(out[i], want):
-                    raise NPUResultMismatch(f"NPU {self.name} disagrees with the CPU: "
-                                            f"{int((out[i] != want).sum())} of {want.numel()} values differ")
-        stats.launches += xq.shape[0] * len(self.op.slabs)
+        op = self.op(xq.shape[0])
+        out = op(xq)
+        if verify:
+            want = self.cpu(xq)
+            if not torch.equal(out, want):
+                raise NPUResultMismatch(f"NPU {self.name} disagrees with the CPU: "
+                                        f"{int((out != want).sum())} of {want.numel()} values differ")
+        stats.launches += 1
         return out
 
 
@@ -116,16 +120,15 @@ def _failed(layer, e):
 
 
 def _first_call(cfg, layer, xq):
-    """Build the layer, verify its first launch, and pick its device."""
+    """Build the layer's op, verify its first launch, and pick its device."""
     if not kernels.available():
         layer.device = "cpu"
         return
     try:
-        layer.build()
-        layer.npu(xq[:1], verify=cfg.verify != "off")
+        layer.npu(xq, verify=cfg.verify != "off")
         layer.device = "npu"
         if cfg.policy == "auto":
-            npu_ms, cpu_ms = _time(lambda: layer.npu(xq[:1])), _time(lambda: layer.cpu(xq[:1]))
+            npu_ms, cpu_ms = _time(lambda: layer.npu(xq)), _time(lambda: layer.cpu(xq))
             layer.device = "npu" if npu_ms < cpu_ms else "cpu"
             decisions[(layer.name,)] = (layer.device, round(npu_ms, 3), round(cpu_ms, 3))
             if cfg.verbose:
@@ -133,6 +136,29 @@ def _first_call(cfg, layer, xq):
                             cpu_ms, layer.device)
     except Exception as e:      # build / context / launch failure, or a mismatch
         _failed(layer, e)
+
+
+def _share():
+    """One hardware context for every NPU conv built so far (tl.extra.npu.conv3x3.share_context).
+
+    Each op starts in its own context, and running one after another op's costs a context
+    switch (~2 ms); in a shared context a launch rewrites its configuration instead (~0.4 ms).
+    Done once the first pass has built the ops (a layer's second call), again if more appear.
+    TORCH_XDNA_CONV_SHARED_CONTEXT=0 keeps the separate contexts.
+    """
+    if os.environ.get("TORCH_XDNA_CONV_SHARED_CONTEXT", "1") == "0":
+        return
+    ops = [op for _, layer in _layers.values() if layer.device == "npu" for op in layer.ops.values()]
+    if len(ops) < 2 or all(id(op) in _shared for op in ops):
+        return
+    try:
+        from triton.language.extra.npu import conv3x3
+
+        conv3x3.share_context(ops)
+    except Exception as e:      # separate contexts still work, only slower
+        log.warning("torch_xdna: could not share one NPU context between %d convs: %s", len(ops), e)
+    _shared.clear()
+    _shared.update(id(op) for op in ops)
 
 
 def conv3x3(cfg, xq, weight, relu):
@@ -146,6 +172,8 @@ def conv3x3(cfg, xq, weight, relu):
             layer.calibrate(xq[0])
         if layer.device is None:
             _first_call(cfg, layer, xq)
+        elif layer.device == "npu" and n in layer.ops:
+            _share()
         q, device = None, "cpu"
         if layer.device == "npu":
             try:

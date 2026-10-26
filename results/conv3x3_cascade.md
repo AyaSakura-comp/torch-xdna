@@ -91,9 +91,10 @@ tail's lock (3.2%) and memory (2.9%) stalls. Short images pay the fill/drain of 
 
 ```python
 from triton.language.extra.npu import conv3x3
-op = conv3x3.Conv3x3(w_int8, height=H, width=W, shift=12, relu=False)   # w [Co, Ci, 3, 3]
-y = op(x_int8)                     # [Ci, H, W] -> [Co, H, W] int8 (uint8 with relu)
+op = conv3x3.Conv3x3(w_int8, height=H, width=W, shift=12, relu=False, batch=N)  # w [Co, Ci, 3, 3]
+y = op(x_int8)                     # [N, Ci, H, W] -> [N, Co, H, W] int8 (uint8 with relu)
 op.set_shift(10)                   # rewrites the weight trailers, no rebuild
+conv3x3.share_context(ops)         # a model's ops in one hardware context (see "Whole models")
 ```
 
 * Not a `@triton.jit` kernel: weights resident across an image and partial sums passed core to
@@ -102,17 +103,19 @@ op.set_shift(10)                   # rewrites the weight trailers, no rebuild
 * Builds: the kernel object with Peano (cached by source, defines, toolchain), the IRON design in a
   subprocess (mlir-aie's MLIR bindings and mlir-air's, which the Triton backend has loaded, cannot
   share an interpreter: "Option registered more than once", or a nanobind error with DEEPBIND),
-  cached by geometry. Runs through pyxrt; ops of one geometry share one hardware context.
+  cached by geometry, as a full ELF (or an xclbin). Runs through pyxrt; ops of one geometry
+  share one hardware context.
 * Host layouts (`kernels/conv3x3_host.c`, OpenMP over torch's thread count, built with the
   system C compiler on first use; torch permutes otherwise). For the 25 MB input of 1536 x 64:
   pack 0.74-0.85 ms (torch permute 2.8-3.6 ms); unpack 1.5 ms after switching to whole 64-byte
   line stores (1.8-2.1 ms before; 256 x 256: 3.7 -> 1.3 ms), read straight from the output
   buffer's mapping. (Measured with other jobs on the machine, load 7-13; AVX-512 VBMI `vpermb`
   for the 8x8 byte transpose gave nothing measurable, so the portable version stayed.)
-* Limits: Ci a multiple of 16 up to 256, Co a multiple of 32 (slabs of 256), W a multiple of 64,
-  stride 1, padding 1, no bias.
-* `examples/conv3x3_cascade/conv3x3_cascade.py`: 5 shapes x 2 shifts bit-exact (incl. Ci = 64/128,
-  Co = 64/512, W = 128, fused ReLU).
+* Limits: Ci up to 512, stride 1, padding 1, no bias (first version: Ci a multiple of 16 up to
+  256, Co of 32, W of 64; generalized in "Whole models" below).
+* `examples/conv3x3_cascade/conv3x3_cascade.py`: 6 shapes covering every split (2- and 4-core
+  chains, 1-4 partitions, padded Ci, narrow tiles, batches, ReLU) bit-exact, then all of them
+  interleaved in one shared context.
 
 ## torch.compile
 
@@ -132,8 +135,9 @@ model = torch.compile(model, backend="xdna", options={"policy": "npu"})
 * A layer's first NPU launch is compared bit for bit with the CPU's integers; a mismatch, a build or
   launch failure moves that layer to the CPU. `policy="auto"` times both per layer.
 * Tests (`tests/test_backend.py`): which convs are rewritten and which ReLU fused; three convs
-  (batch 2) on the NPU equal to the CPU's integers, rel err vs fp32 2.9%; a corrupted first
-  launch caught and that layer moved to the CPU.
+  (batch 2) on the NPU equal to the CPU's integers, rel err vs fp32 2.9%; padded shapes (Ci 3,
+  Co 48, 13 x 37, batch 2) likewise; a corrupted first launch caught and that layer moved to
+  the CPU; convs left alone without an NPU.
 
 `examples/conv_xdna.py` (four bias-free 3x3 convs + ReLU, 256 channels, 1 x 64 x 64; median of
 10, one run, load ~4):
@@ -149,12 +153,74 @@ more than at 1536 rows; with the machine under heavier load the same comparison 
 2.0 ms. Only the op's integers are checked bit for bit; the 3.4% is int8 quantization over four
 layers (per-tensor activations, per-channel weights).
 
+## Whole models: any layer shape, one hardware context (VGG-16 all on the NPU)
+
+To run complete CNNs the op was generalized (Triton-XDNA 0ea3101):
+
+* **Any H x W, batches.** The host places the images on the strips with a plan of pieces:
+  32-column tiles, rows spread evenly over the strips, narrow tiles (<= 15 wide) side by side in
+  one 32-pixel line, every piece with its own halo lines. A batch is one launch.
+* **Ci up to 512** with 4-core chains (Ci/4 per core, the same kernel object with the mid role);
+  Ci is padded to the chain's channels (VGG's first conv, Ci = 3, to 16).
+* **The whole array for small Co.** R partitions x 2 strips x G channel groups of chains
+  (R*G = 8, or 4 with 4-core chains), plus OGP output-channel pairs per chain as local memory
+  allows: Co = 64 runs as 4 partitions of 2 groups instead of leaving 6 columns idle. The
+  weights move off memtiles 0-3 when those already split the input (6 output DMA channels).
+* **All Co slabs in one launch**; the cores reload their weights per slab.
+
+| VGG-16 layer | chain x CG, OGP, G x R | NPU run (batch 1) |
+|---|---|---|
+| conv1_1 3->64, 224^2 | 2 x 1, 2, 2 x 4 | 0.53 ms |
+| conv1_2 64->64, 224^2 | 2 x 4, 2, 2 x 4 | 0.57 ms |
+| conv2_1 64->128, 112^2 | 2 x 4, 4, 2 x 4 | 0.52 ms |
+| conv2_2 128->128, 112^2 | 2 x 8, 4, 2 x 4 | 0.61 ms |
+| conv3_1 128->256, 56^2 | 2 x 8, 4, 4 x 2 | 0.56 ms |
+| conv3_2/3 256->256, 56^2 | 2 x 16, 2, 8 x 1 | 0.71 ms each |
+| conv4_1 256->512, 28^2 | 2 x 16, 2, 8 x 1 (2 slabs) | 0.69 ms |
+| conv4_2/3 512->512, 28^2 | 4 x 16, 2, 4 x 1 (4 slabs) | 0.74 ms each |
+| conv5_1-3 512->512, 14^2 | 4 x 16, 2, 4 x 1 (4 slabs, 14-wide tiles in pairs) | 0.68 ms each |
+
+**Hardware contexts.** Two ops built as separate programs alternate at 4.8 ms per pair
+(0.20 + 0.09 ms of work): ~2.3 ms per context switch, the same for xclbins and full ELFs. A
+model's layers run one after another, so every launch would pay it. `share_context(ops)` merges
+the ops' designs (one `aie.device` each) into one full ELF with one kernel per design and the
+`load_pdi` of each runtime sequence expanded into explicit writes (`aiecc --expand-load-pdis`;
+a plain reloaded PDI left the previous device's routes and timed out on the next run): the
+same pair then alternates at 1.13 ms, each launch rewriting its own configuration. That
+rewrite is mostly the cores' programs (32 x ~5.4 KB of fully unrolled kernel per layer, of a
+~110-220 KB configuration), ~0.4 ms per launch. Control-packet loading (`--load-pdi-to-ctrl-pkt`)
+needs shim DMA channels the design already uses. torch-xdna merges after the first pass; ops of
+one design share a kernel, and a single design is left in its own context.
+
+**VGG-16** (`examples/vgg16_xdna.py`, ImageNet weights, public-domain sample images): 100% of
+the conv and linear MACs on the NPU, top-1 7/8 and logits cosine >= 0.991 against fp32 eager.
+Batch 1: 20.0 ms vs 32.2 ms for Inductor fp32 on the CPU; batch 8: 68.5 ms vs 142-162 ms.
+
+| batch 1, 20.2 ms | ms |
+|---|---|
+| 13 conv launches (configuration ~0.45 ms each, MACs ~0.7 ms in all) | 8.45 |
+| their host layouts (pack / unpack) | 2.1 |
+| linears (Triton-XDNA GEMM; fc6 streams 103 MB of int8 weights) | 5.7 + 1.5 + 0.7 |
+| quantize / dequantize, ReLU, pooling, Python (Inductor, CPU) | 1.85 |
+
+At batch 8 (64.1 ms) the NPU runs take 14.5 ms, the host layouts 12.9 ms, the linears 8.4 ms and
+the CPU's fp32 work between the NPU ops 28.4 ms: activations of up to 100 MB in fp32, read and
+written several times per layer.
+
+**ResNet-50** gets 36.8% of its conv MACs onto the NPU (the 13 3x3 stride-1 convs; top-1 8/8):
+1x1 convs (44% + 7.5% strided), the stride-2 3x3s (8.5%) and the 7x7 stem (2.9%) have no NPU
+kernel, and at batch 1 the split run (18.4 ms) is slower than Inductor fp32 alone (10.3 ms).
+
 ## What is left
 
-* Host work around a launch: the activations are quantized and laid out by the CPU on every call,
-  and the output comes back to NCHW. Consecutive NPU convs could hand their int8 output to the
-  next layer in the NPU's layout (the halo windows built by DMA), with no host pass between them.
-* Batches run as one launch per image; images could be stacked as more bands in one launch.
-* Ci > 256: longer chains (the 4-core chain design) or splitting the reduction over launches.
+* The CPU between NPU ops: activations go back to fp32 NCHW after every conv, are re-quantized
+  and laid out for the next. Keeping them int8 in the NPU's layout from one conv to the next
+  (requantize, ReLU, pool and the next layer's halo lines on the NPU) removes both the host
+  layouts and the fp32 traffic, the largest costs at batch 8.
+* Reconfiguration per launch (~0.45 ms, mostly core programs): a smaller kernel (a rolled channel
+  loop) shrinks it; a sequence variant without the reload would serve repeated launches.
+* ResNet-style layers: a 1x1 kernel (no ky / kx, more output channels per core), stride 2
+  (polyphase or subsampled output), the stem.
 * Bias inside the NPU (added to the int32 sums before the shift) would let a conv + bias + ReLU
   fuse completely.
+* Ci > 512: longer chains do not fit a column; split the reduction over launches.

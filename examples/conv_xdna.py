@@ -73,11 +73,7 @@ def main():
 
     op_ms = 0.0
     for _, layer in xconv._layers.values():
-        def launch(_, slabs=layer.op.slabs):
-            for _, _, prog, (xbo, _), (wbo, _), (ybo, _) in slabs:
-                prog.run(xbo, wbo, ybo)
-
-        op_ms += timed(launch, None, a.reps) * a.batch
+        op_ms += timed(lambda _, op=layer.ops[a.batch]: op.launch(), None, a.reps)
     print(f"{a.layers} x conv3x3 {a.channels}->{a.channels} on {a.batch}x{a.size}x{a.size} ({gmac:.2f} GMAC)")
     print(f"  CPU (Inductor, fp32):  {cpu_ms:8.2f} ms  {2 * gmac / cpu_ms:6.2f} TOPS")
     print(f"  NPU (xdna, int8):      {npu_ms:8.2f} ms  {2 * gmac / npu_ms:6.2f} TOPS end to end; rel err vs fp32 "
