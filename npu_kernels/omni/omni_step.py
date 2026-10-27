@@ -20,8 +20,9 @@ moves 4608-byte tiles (32 rows x 128 columns of bfp16) between DDR and the cores
             every row group on the weights' broadcast (B), an online softmax runs over them
 
 Rows: NG row groups of 128 = cond (row blocks 0, 1: positions 64g..64g+63) + uncond (row
-blocks 2, 3: the same positions); every GEMM runs once per group (its weights stream NG
-times), keys past each sequence's length are masked.
+blocks 2, 3: the same positions); QKV, O and down run once per group (their weights stream
+NG times), gate/up and the heads once per pair of groups (ceil(NG / 2) times: the cores
+hold both groups' A slices); keys past each sequence's length are masked.
 
 DDR (one activation buffer, tiles of 4608 bytes): PARAMS 1 | GAMMA NL | then per row group
   ATT 64 | X 32 | GU 192 | X1 32 | QR 160
@@ -120,6 +121,7 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
     from aie.iron.runtime import TaskGroup
 
     L = Layout(NL, NG)
+    NP = (NG + 1) // 2          # row group pairs (gate/up, heads)
     # attention: column c runs kv head c for both sequences. A traced build leaves
     # column 6 out (kv head 6 is not computed): its 4 output streams would otherwise
     # fill every channel from row 2 down, leaving none for trace packets
@@ -137,18 +139,18 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
     kt_ = lambda name, *a: Kernel(name + "_t", obj_tail, list(a))   # noqa: E731
     k = {
         False: dict(params=kb_("oc_params", tile_ty, tb), phase=kb_("og_phase", ctl_ty, tb, i32, i32),
-                    load=kb_("og_load", tile_ty, tb, i32, i32, i32),
-                    ssq_head=kb_("og_ssq_head", tb, i32), ssq_mid=kb_("og_ssq_mid", tb, i32),
-                    mac=kb_("og_mac", tile_ty, tb, i32, i32, i32, i32), oa_q=kb_("oa_q", tile_ty, tb),
+                    load=kb_("og_load", tile_ty, tb, i32, i32, i32, i32),
+                    ssq_head=kb_("og_ssq_head", tb, i32, i32), ssq_mid=kb_("og_ssq_mid", tb, i32, i32),
+                    mac=kb_("og_mac", tile_ty, tb, i32, i32, i32, i32, i32), oa_q=kb_("oa_q", tile_ty, tb),
                     oa_k=kb_("oa_k", tile_ty, tb, i32, i32, i32), oa_soft=kb_("oa_soft", tb, i32, i32),
                     oa_v=kb_("oa_v", tile_ty, tb, i32, i32),
                     oa_out=kb_("oa_out", tile_ty, tb), qp_gamma=kb_("qp_gamma", tile_ty, tb),
                     qp_rope=kb_("qp_rope", tile_ty, tb), qp_qk=kb_("qp_qk", tile_ty, tile_ty, tb, i32),
                     qp_v=kb_("qp_v", tile_ty, tile_ty, tb)),
         True: dict(params=kt_("oc_params", tile_ty, tt), phase=kt_("og_phase", ctl_ty, tt, i32, i32),
-                   take_x=kt_("oc_take_x", tile_ty, tt), load=kt_("og_load", tile_ty, tt, i32, i32, i32),
-                   ssq_tail=kt_("og_ssq_tail", tt, i32),
-                   mac=kt_("og_mac", tile_ty, tt, tile_ty, i32, i32, i32, i32),
+                   take_x=kt_("oc_take_x", tile_ty, tt), load=kt_("og_load", tile_ty, tt, i32, i32, i32, i32),
+                   ssq_tail=kt_("og_ssq_tail", tt, i32, i32), copy=kt_("og_copy", tile_ty, tt),
+                   mac=kt_("og_mac", tile_ty, tt, tile_ty, i32, i32, i32, i32, i32),
                    qp_gamma=kt_("qp_gamma", tile_ty, tt), qp_rope=kt_("qp_rope", tile_ty, tt),
                    qp_qk=kt_("qp_qk", tile_ty, tile_ty, tt, i32), qp_v=kt_("qp_v", tile_ty, tile_ty, tt),
                    oa_q=kt_("oa_q", tile_ty, tt),
@@ -176,19 +178,21 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
     def gemm(role, A, B, O, st, ctl, kk):
         """One GEMM phase; its counts come from ctl (og_phase), so every phase of the step
         runs this one piece of code."""
-        nch = ctl[0]
-        for ch in range_(nch):
-            for part in range_(ctl[7]):
-                x = A.acquire(1)
-                kk["load"](x, st, ch, part, ctl[7])
-                A.release(1)
-        for _ in range_(ctl[3]):
-            if role == "head":
-                kk["ssq_head"](st, nch)
-            elif role == "mid":
-                kk["ssq_mid"](st, nch)
-            else:
-                kk["ssq_tail"](st, nch)
+        nch, ngi = ctl[0], ctl[4]
+        for gi in range_(ngi):
+            for ch in range_(nch):
+                for part in range_(ctl[7]):
+                    x = A.acquire(1)
+                    kk["load"](x, st, ch, part, ctl[7], gi)
+                    A.release(1)
+        for gi in range_(ngi):
+            for _ in range_(ctl[3]):
+                if role == "head":
+                    kk["ssq_head"](st, nch, gi)
+                elif role == "mid":
+                    kk["ssq_mid"](st, nch, gi)
+                else:
+                    kk["ssq_tail"](st, nch, gi)
         for u in range_(ctl[1]):
             if role == "tail":
                 # the output object first: the epilogues write into it
@@ -204,12 +208,17 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
                 for ch in range_(nch):
                     w = B.acquire(1)
                     if role == "tail":
-                        kk["mac"](w, st, o, ch, nch, rcode, g)
+                        kk["mac"](w, st, o, ch, nch, rcode, g, ngi)
                     else:
-                        kk["mac"](w, st, ch, nch, rcode, g)
+                        kk["mac"](w, st, ch, nch, rcode, g, ngi)
                     B.release(1)
             if role == "tail":
                 O.release(1)
+                # a pair's second row group: its tile waited in the state
+                for _ in range_(ctl[8]):
+                    o2 = O.acquire(1)
+                    kk["copy"](o2, st)
+                    O.release(1)
 
     def post(A, O, st, kk, r):
         """QKV post-pass of column c, core r (row block r): gamma, then per row group the
@@ -265,7 +274,7 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
             p = A.acquire(1)
             kk["params"](p, st)
             A.release(1)
-            for _ in range_(NG * (4 * NL + 1)):
+            for _ in range_(NL * (3 * NG + NP) + NP):
                 kk["phase"](ctl, st, NL, NG)
                 gemm(role, A, B, O, st, ctl, kk)
                 if att[c]:
@@ -307,9 +316,19 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
         oc = [next(it) if has_o[c] else None for c in range(NCOL)]
         col_w = NL * wl + HEAD_W          # objects of one column's weight stream
 
-        def weights(c, off, n, group):
-            """n objects of column c's stream from off, once per row group."""
-            bp[c].fill(Wi, tap(w_len, c * col_w + off, [(NG, 0), (n, 1)]), group=group)
+        def weights(c, off, n, group, reps=NG):
+            """n objects of column c's stream from off, once per row group (or pair)."""
+            bp[c].fill(Wi, tap(w_len, c * col_w + off, [(reps, 0), (n, 1)]), group=group)
+
+        def pair_drains(dst, ten_len, base, units, gstride, group):
+            """The tails' output of a paired phase: per pair, unit by unit, each group's tiles."""
+            per = -(-units // -(-units // 63))           # units per transfer (outer dim <= 63)
+            for p_ in range(NP):
+                ngi = min(2, NG - 2 * p_)
+                for u0 in range(0, units, per):
+                    n = min(per, units - u0)
+                    oc[7].drain(dst, tap(ten_len, base + 2 * p_ * gstride + 4 * u0, [(n, 4), (ngi, gstride), (4, 1)]),
+                                wait=p_ == NP - 1 and u0 + n == units, group=group)
 
         def per_group(name, off, n):
             """n tiles at off of region name, in every row group."""
@@ -374,11 +393,14 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
             wr = TaskGroup()
             for c in range(NCOL):
                 weights(c, base + W_QKV, W_O, wr)
-                weights(c, base + W_QKV + W_O, W_GU, wr)
+                weights(c, base + W_QKV + W_O, W_GU, wr, NP)
                 weights(c, base + W_QKV + W_O + W_GU, W_DOWN, wr)
             wq = TaskGroup()
             for c in range(NCOL):
-                weights(c, base + wl if layer + 1 < NL else NL * wl, W_QKV if layer + 1 < NL else HEAD_W, wq)
+                if layer + 1 < NL:
+                    weights(c, base + wl, W_QKV, wq)
+                else:
+                    weights(c, NL * wl, HEAD_W, wq, NP)
             tg.finish()
             # O: chunks = ATT heads 2c, 2c+1; tails: heads 14, 15 + the residual x
             tg = TaskGroup()
@@ -386,11 +408,11 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
                 ap[c].fill(Ai, per_group("ATT", 8 * c, 8 if c < NCOL - 1 else 40), group=tg)
             oc[7].drain(Ai, per_group("X1", 0, 32), wait=True, group=tg)
             tg.finish()
-            # gate/up: units alternate gate i, up i
+            # gate/up, per pair of groups: units alternate gate i, up i
             tg = TaskGroup()
             for c in range(NCOL):
                 ap[c].fill(Ai, per_group("X1", 4 * c, 4), group=tg)
-            oc[7].drain(Ai, per_group("GU", 0, 192), wait=True, group=tg)
+            pair_drains(Ai, act_len, L["GU", 0], 48, GS, tg)
             tg.finish()
             # down: chunk = intermediate block 3c + ch, as its gate then its up tiles;
             # tails: blocks 21-23 + the residual x1
@@ -401,10 +423,10 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
             tg.finish()
             wr.finish()
             tg = TaskGroup()
-        # the heads, per group: chunk = X unit c
+        # the heads, per pair of groups: chunk = X unit c
         for c in range(NCOL):
             ap[c].fill(Ai, per_group("X", 4 * c, 4), group=tg)
-        oc[7].drain(Lo, run_tap(log_len, 0, NG * HEAD_U * NROW), wait=True, group=tg)
+        pair_drains(Lo, log_len, 0, HEAD_U, HEAD_U * NROW, tg)
         tg.finish()
         wq.finish()
 

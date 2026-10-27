@@ -6,8 +6,10 @@
 // accumulation fp32.
 //
 // Rows come in groups of 128 (cond positions 64g..64g+63, uncond the same);
-// each GEMM phase runs once per group (its weights stream once per group), the
-// attention runs once per layer over every group's keys.
+// each GEMM phase runs once per group (its weights stream once per group) or,
+// gate/up and the heads, once per pair of groups (the cores hold both groups'
+// A slices and use each weight object for both); the attention runs once per
+// layer over every group's keys.
 //
 // QKV post-pass (between the QKV GEMM and the attention, every core): q and
 // k heads get their q/k-norm, gamma and RoPE, V tiles are transposed into
@@ -77,11 +79,13 @@ constexpr int OFF_EPI = 8;                             // int32: the GEMM phase'
 constexpr int OFF_PC = 16;                             // int32 [3]: phase counters (group, kind, layer)
 constexpr int OFF_ABUF = 64;                           // GEMM A slice (13824)
 constexpr int OFF_ACC = OFF_ABUF + 2 * ABUF_PAIR;      // fp32 [4 rb][4 nb][64] (4096)
-constexpr int OFF_RSTD = OFF_ACC + 4096;               // bf16 [4 rb][64]: row norms in all lanes (512)
-constexpr int ST_BODY = OFF_RSTD + 512;
-// tail only: the x tile of the residual (O, down)
+constexpr int OFF_RSTD = OFF_ACC + 4096;               // bf16 [2 groups][4 rb][64]: row norms in all lanes
+constexpr int ST_BODY = OFF_RSTD + 1024;
+// tail only: the x tile of the residual (O, down), the second group's output
+// tile of a pair
 constexpr int OFF_X = ST_BODY;
-constexpr int ST_TAIL = OFF_X + TILE;
+constexpr int OFF_X2 = OFF_X + TILE;
+constexpr int ST_TAIL = OFF_X2 + TILE;
 // the QKV post-pass overlays [OFF_ABUF ...): the RoPE tile of its row block
 // (4608), gamma q/k bf16 [256] (512), a row pair's results bf16 [2][16 cb][64]
 constexpr int OFF_QR = OFF_ABUF;
@@ -230,28 +234,33 @@ extern "C" {
 
 // ------------------------------------------------------------------ phases
 // The step's GEMMs, in order: per layer QKV for every row group, O for every
-// group, gate/up for every group, down for every group; then the heads for
-// every group. ctl (read by the design's loops): chunks of the K slice, output
-// units, groups (of 32 columns) per unit, RMSNorm, -, x tiles per unit
-// (tails), QKV post-pass + attention after the phase, A tiles per chunk.
+// group, gate/up for every pair of groups, down for every group; then the
+// heads for every pair. ctl (read by the design's loops): chunks of the K
+// slice, output units, groups (of 32 columns) per unit, RMSNorm, row groups,
+// x tiles per unit (tails), QKV post-pass + attention after the phase, A tiles
+// per chunk, row groups - 1.
 enum { EPI_RES = 1, EPI_SCALE = 2, EPI_LOGITS = 3 };
-enum { CTL_ATT = 6 };
+enum { CTL_NGI = 4, CTL_ATT = 6, CTL_PAIR = 8 };
 
 void SYM(og_phase)(int32_t *ctl, uint8_t *st, int32_t nl, int32_t ng) {
   static const int32_t T[5][8] = {
-      // nch units gpu norm - x attn parts
+      // nch units gpu norm paired x attn parts
       {1, 32, 4, 1, 0, 0, 0, 1},   // QKV, normed (q/k-norm, RoPE: the post-pass)
       {2, 8, 4, 0, 0, 1, 0, 1},    // O (+ residual)
-      {1, 48, 4, 1, 0, 0, 0, 1},   // gate / up, normed, as tiles (gate unit, up unit, ...)
+      {1, 48, 4, 1, 1, 0, 0, 1},   // gate / up, normed, as tiles (gate unit, up unit, ...)
       {3, 8, 4, 0, 0, 1, 0, 2},    // down (+ residual); A = silu(gate) * up, made on load
-      {1, 129, 2, 1, 0, 0, 0, 1}}; // audio heads (64 columns per object)
+      {1, 129, 2, 1, 1, 0, 0, 1}}; // audio heads (64 columns per object)
   static const int32_t EPI[5] = {EPI_SCALE, EPI_RES, EPI_SCALE, EPI_RES, EPI_LOGITS};
   int32_t *pc = (int32_t *)(st + OFF_PC);
   const int g = pc[0], kind = pc[2] < nl ? pc[1] : 4;
   NOUNROLL for (int f = 0; f < 8; f++) ctl[f] = T[kind][f];
+  const int paired = T[kind][CTL_NGI];
+  const int nph = paired ? (ng + 1) >> 1 : ng;
+  ctl[CTL_NGI] = paired && 2 * g + 1 < ng ? 2 : 1;
+  ctl[CTL_PAIR] = ctl[CTL_NGI] - 1;
   ctl[CTL_ATT] = kind == 0 && g == ng - 1;
   *(int32_t *)(st + OFF_EPI) = EPI[kind];
-  if (++pc[0] == ng) {
+  if (++pc[0] == nph) {
     pc[0] = 0;
     if (++pc[1] == 4) {
       pc[1] = 0;
@@ -289,7 +298,8 @@ static inline ACC silu(VB64 g) {
 // The gate tile waits in the region past the GEMM state (attention scratch;
 // on the tails the x tile, taken only after the loads).
 constexpr int OFF_GTMP = ST_BODY;
-void SYM(og_load)(const uint8_t *tile, uint8_t *st, int32_t ch, int32_t part, int32_t parts) {
+void SYM(og_load)(const uint8_t *tile, uint8_t *st, int32_t ch, int32_t part, int32_t parts, int32_t gi) {
+  ch += gi;    // a pair's single-chunk slices sit in chunk slots 0, 1
   if (parts == 2 && part == 0) {
     copy_tile(tile, st + OFF_GTMP);
     return;
@@ -313,11 +323,11 @@ void SYM(og_load)(const uint8_t *tile, uint8_t *st, int32_t ch, int32_t part, in
   }
 }
 
-// Sums of squares of the slice's 32 rows (nch chunks) as [4 rb][8]: the
-// diagonal of A A^T per row block.
-NOINLINE static void ssq_own(const uint8_t *st, int nch, float *out) {
+// Sums of squares of the slice's 32 rows (nch chunks, from chunk slot gi) as
+// [4 rb][8]: the diagonal of A A^T per row block.
+NOINLINE static void ssq_own(const uint8_t *st, int nch, int gi, float *out) {
   NOUNROLL for (int rb = 0; rb < 4; rb++) {
-    const uint8_t *base = st + OFF_ABUF + (rb >> 1) * ABUF_PAIR + (rb & 1) * BLK;
+    const uint8_t *base = st + OFF_ABUF + (rb >> 1) * ABUF_PAIR + gi * TILE_PAIR + (rb & 1) * BLK;
     ACC g = aie::zeros<accfloat, 64>();
     NOUNROLL for (int kb = 0; kb < nch * 16; kb++) {
       BV a = load_blk(base + kb * PAIR);
@@ -329,16 +339,16 @@ NOINLINE static void ssq_own(const uint8_t *st, int nch, float *out) {
 }
 
 #ifndef OMNI_TAIL
-void og_ssq_head(uint8_t *st, int32_t nch) {
+void og_ssq_head(uint8_t *st, int32_t nch, int32_t gi) {
   alignas(64) float s[32];
-  ssq_own(st, nch, s);
+  ssq_own(st, nch, gi, s);
   put_mcd(*(v16float *)s);
   put_mcd(*(v16float *)(s + 16));
 }
 
-void og_ssq_mid(uint8_t *st, int32_t nch) {
+void og_ssq_mid(uint8_t *st, int32_t nch, int32_t gi) {
   alignas(64) float s[32];
-  ssq_own(st, nch, s);
+  ssq_own(st, nch, gi, s);
   aie::vector<float, 16> a = (v16float)get_scd_v16accfloat(1);
   aie::vector<float, 16> b = (v16float)get_scd_v16accfloat(1);
   put_mcd((v16float)aie::add(a, aie::load_v<16>(s)));
@@ -350,15 +360,15 @@ void og_ssq_mid(uint8_t *st, int32_t nch) {
 // [4 rb][64] (each row in all 8 lanes of its row of the block). The normed
 // GEMMs all have K = D = 1024: rstd = 32 / sqrt(sum + 1024 eps), the 32 an exact
 // bf16 product (the scalar unit has no float multiply).
-void SYM(og_ssq_tail)(uint8_t *st, int32_t nch) {
+void SYM(og_ssq_tail)(uint8_t *st, int32_t nch, int32_t gi) {
   alignas(64) float s[32];
-  ssq_own(st, nch, s);
+  ssq_own(st, nch, gi, s);
   aie::vector<float, 16> a = (v16float)get_scd_v16accfloat(1);
   aie::vector<float, 16> b = (v16float)get_scd_v16accfloat(1);
   aie::store_v(s, aie::add(a, aie::load_v<16>(s)));
   aie::store_v(s + 16, aie::add(b, aie::load_v<16>(s + 16)));
   NOUNROLL for (int i = 0; i < 32; i++) s[i] = invsqrt(s[i] + 1024 * EPS);
-  bfloat16 *r = (bfloat16 *)(st + OFF_RSTD);
+  bfloat16 *r = (bfloat16 *)(st + OFF_RSTD) + gi * 256;
   NOUNROLL for (int rb = 0; rb < 4; rb++)
     aie::store_v(r + rb * 64, aie::mul(to_bf(rows8(aie::load_v<8>(s + rb * 8))), bfloat16(32.0f)).template to_vector<bfloat16>());
 }
@@ -387,20 +397,21 @@ static inline void cas_put(ACC a) {
 // AIE2P has no fp32 vector multiply (it is emulated with bf16 pieces), so the
 // epilogues multiply bf16 operands into fp32 accumulators and add there. They
 // run on a group's sums as the last chunk's mac leaves them in registers.
-static inline VB64 rstd_bf(const uint8_t *st, int rb) {
-  return aie::load_v<64>((const bfloat16 *)(st + OFF_RSTD) + rb * 64);
+static inline VB64 rstd_bf(const uint8_t *st, int gi, int rb) {
+  return aie::load_v<64>((const bfloat16 *)(st + OFF_RSTD) + (gi * 4 + rb) * 64);
 }
 
 static inline VB64 scaled(ACC a, VB64 r) { return aie::mul(a.template to_vector<bfloat16>(), r).template to_vector<bfloat16>(); }
 
 // The epilogue of a quarter of group g's sums (row blocks 2p, 2p + 1 x column
 // blocks 2q, 2q + 1 of the group), as the last chunk's mac leaves them in
-// registers; o is the unit's output object:
+// registers; o is the output tile (the unit's object, or for the second row
+// group of a pair a tile in the state that og_copy moves later):
 //   gate/up       y = a * rstd, bfp16 blocks of the output tile
 //   O, down       y = x + a (x: this unit's tile of the residual), the same
 //   heads         y = a * rstd, bf16 8x8 blocks [g % 2][4 rb][4 nb][64] (the
 //                 unit's object carries both groups, its first 4 KB)
-static inline void epi_pq(uint8_t *st, uint8_t *o, int e, int g, int p, int q, ACC a00, ACC a01, ACC a10, ACC a11) {
+static inline void epi_pq(uint8_t *st, uint8_t *o, int e, int gi, int g, int p, int q, ACC a00, ACC a01, ACC a10, ACC a11) {
   const int rb = 2 * p, nb = 2 * q, cb = 4 * (g & 3) + nb;
   if (e == EPI_RES) {
     const uint8_t *x = st + OFF_X;
@@ -409,7 +420,7 @@ static inline void epi_pq(uint8_t *st, uint8_t *o, int e, int g, int p, int q, A
         << bfp(aie::add(a01, decode(tile_blk(x, rb, cb + 1)))) << bfp(aie::add(a11, decode(tile_blk(x, rb + 1, cb + 1))));
     return;
   }
-  const VB64 r0 = rstd_bf(st, rb), r1 = rstd_bf(st, rb + 1);
+  const VB64 r0 = rstd_bf(st, gi, rb), r1 = rstd_bf(st, gi, rb + 1);
   const VB64 y00 = scaled(a00, r0), y01 = scaled(a01, r0), y10 = scaled(a10, r1), y11 = scaled(a11, r1);
   if (e == EPI_LOGITS) {
     bfloat16 *d = (bfloat16 *)o + (g & 1) * 1024 + (rb * 4 + nb) * 64;
@@ -422,15 +433,17 @@ static inline void epi_pq(uint8_t *st, uint8_t *o, int e, int g, int p, int q, A
   BO out((bfp16ebs8 *)(o + (p * 16 + cb) * 2 * BLK));
   out << bfp(y00) << bfp(y10) << bfp(y01) << bfp(y11);
 }
+
+// The second row group's output tile of a pair into its object
+void SYM(og_copy)(uint8_t *o, uint8_t *st) { copy_tile(st + OFF_X2, o); }
 #endif
 
-// one group's (g) chunk ch of nch#endif
-
-// one group's (g) chunk ch of nch: acc [4 rb][4 nb] += A[:, chunk ch] x W^T
+// one group's (g) chunk ch of nch: acc [4 rb][4 nb] += A[:, chunk ch] x W^T,
+// for each of the ngi row groups of the phase (pairs: nch = 1)
 #ifdef OMNI_TAIL
-void SYM(og_mac)(const uint8_t *b, uint8_t *st, uint8_t *o, int32_t ch, int32_t nch, int32_t role, int32_t g) {
+void SYM(og_mac)(const uint8_t *b, uint8_t *st, uint8_t *o, int32_t ch, int32_t nch, int32_t role, int32_t g, int32_t ngi) {
 #else
-void SYM(og_mac)(const uint8_t *b, uint8_t *st, int32_t ch, int32_t nch, int32_t role, int32_t g) {
+void SYM(og_mac)(const uint8_t *b, uint8_t *st, int32_t ch, int32_t nch, int32_t role, int32_t g, int32_t ngi) {
 #endif
 #ifdef SKIP_MAC
   return;
@@ -440,8 +453,8 @@ void SYM(og_mac)(const uint8_t *b, uint8_t *st, int32_t ch, int32_t nch, int32_t
 #ifdef OMNI_TAIL
   const int e = *(const int32_t *)(st + OFF_EPI);
 #endif
-  NOUNROLL for (int pq = 0; pq < 4; pq++) {
-    const int p = pq >> 1, q = pq & 1;
+  NOUNROLL for (int gq = 0; gq < 4 * ngi; gq++) {
+    const int gi = gq >> 2, pq = gq & 3, p = pq >> 1, q = pq & 1;
     float *c00 = acc + ((2 * p) * 4 + 2 * q) * 64;
     float *c01 = c00 + 64;
     float *c10 = c00 + 4 * 64;
@@ -454,7 +467,7 @@ void SYM(og_mac)(const uint8_t *b, uint8_t *st, int32_t ch, int32_t nch, int32_t
     } else {
       a00 = cas_get(), a01 = cas_get(), a10 = cas_get(), a11 = cas_get();
     }
-    BS as((const bfp16ebs8 *)(st + OFF_ABUF + p * ABUF_PAIR + ch * TILE_PAIR));
+    BS as((const bfp16ebs8 *)(st + OFF_ABUF + p * ABUF_PAIR + (ch + gi) * TILE_PAIR));
     BS bs((const bfp16ebs8 *)(b + q * TILE_PAIR));
     // software pipelined (5 bundles per 4 MACs, load-bound; 7 without)
     PIPE4 for (int kb = 0; kb < 16; kb++) {
@@ -468,7 +481,7 @@ void SYM(og_mac)(const uint8_t *b, uint8_t *st, int32_t ch, int32_t nch, int32_t
     }
 #ifdef OMNI_TAIL
     if (last) {
-      epi_pq(st, o, e, g, p, q, a00, a01, a10, a11);
+      epi_pq(st, gi ? st + OFF_X2 : o, e, gi, g, p, q, a00, a01, a10, a11);
       continue;
     }
 #else
