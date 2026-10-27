@@ -9,6 +9,10 @@
 // each GEMM phase runs once per group (its weights stream once per group), the
 // attention runs once per layer over every group's keys.
 //
+// QKV post-pass (between the QKV GEMM and the attention, every core): q and
+// k heads get their q/k-norm, gamma and RoPE, V tiles are transposed into
+// V^T tiles; tiles come back from DDR, one row block per core.
+//
 // GEMMs: a row of 8 cores is a cascade chain (west to east) over the K
 // slices; core c holds slice c of its 32 activation rows (abuf) and gets that
 // slice of the weights one group of 32 output columns at a time. The tail
@@ -71,22 +75,18 @@ using V8 = aie::vector<float, 8>;
 constexpr int OFF_KVLEN = 0;                           // int32 [2]
 constexpr int OFF_EPI = 8;                             // int32: the GEMM phase's epilogue
 constexpr int OFF_PC = 16;                             // int32 [3]: phase counters (group, kind, layer)
-constexpr int OFF_UNIT = 28;                           // int32: the tails' output unit within the phase
 constexpr int OFF_ABUF = 64;                           // GEMM A slice (13824)
 constexpr int OFF_ACC = OFF_ABUF + 2 * ABUF_PAIR;      // fp32 [4 rb][4 nb][64] (4096)
 constexpr int OFF_RSTD = OFF_ACC + 4096;               // bf16 [4 rb][64]: row norms in all lanes (512)
 constexpr int ST_BODY = OFF_RSTD + 512;
-// tail only: stash bf16 [4 rb][16 cb][64] (8192; the QKV heads' rows), sums of
-// squares fp32 [4 rb][64] (1024; q/k-norm), x tile of the residual (O, down)
-// or the RoPE tile (QKV) (4608), gamma q/k bf16 [256] (512), q/k-norm factors
-// bf16 [4 rb][64] (512)
-constexpr int OFF_STASH = ST_BODY;
-constexpr int OFF_SS = OFF_STASH + 8192;
-constexpr int OFF_X = OFF_SS + 1024;
-constexpr int OFF_ROPE = OFF_X;
-constexpr int OFF_GAMMA = OFF_X + 4608;
-constexpr int OFF_RQ = OFF_GAMMA + 512;
-constexpr int ST_TAIL = OFF_RQ + 512;
+// tail only: the x tile of the residual (O, down)
+constexpr int OFF_X = ST_BODY;
+constexpr int ST_TAIL = OFF_X + TILE;
+// the QKV post-pass overlays [OFF_ABUF ...): the RoPE tile of its row block
+// (4608), gamma q/k bf16 [256] (512), a row pair's results bf16 [2][16 cb][64]
+constexpr int OFF_QR = OFF_ABUF;
+constexpr int OFF_QG = OFF_QR + TILE;
+constexpr int OFF_QT = OFF_QG + 512;
 // attention overlays [OFF_ABUF ...): the q tile, o fp32 [4 qb][16 db][64],
 // the scores of a chunk's key blocks bf16 [4 qb][8 key blocks of 8][64], P
 // bfp16 [4 qb][8][72], and per row (in all 8 lanes of its block row) the
@@ -100,7 +100,7 @@ constexpr int OFF_AM = OFF_AP + 4 * 4 * NKB * BLK;     // 512
 constexpr int OFF_AF = OFF_AM + 512;                   // 512
 constexpr int OFF_AL = OFF_AF + 512;                   // 1024
 constexpr int ST_ATTN = OFF_AL + 1024;
-static_assert(ST_ATTN == 29504 && ST_TAIL == 33344, "the state buffers of omni_step.py");
+static_assert(ST_ATTN == 29504 && ST_TAIL <= ST_ATTN && OFF_QT + 4096 <= ST_ATTN, "the state buffer of omni_step.py");
 
 // bfp16 blocks of the identity and of ones (exponent 127, mantissa 64 = 1.0)
 alignas(64) static const uint8_t EYE[BLK] = {
@@ -207,6 +207,14 @@ static inline aie::mask<64> first_cols(int n) {
   return aie::mask<64>::from_uint64(((uint64_t)row << 32) | row);
 }
 
+static inline BV bfp(ACC a) { return a.template to_vector<bfp16ebs8>(); }
+
+static inline BV bfp(VB64 v) {
+  ACC a;
+  a.from_vector(v);
+  return a.template to_vector<bfp16ebs8>();
+}
+
 // block (rb, kb) of a tile
 static inline const uint8_t *tile_blk(const uint8_t *t, int rb, int kb) {
   return t + (((rb >> 1) * 16 + kb) * 2 + (rb & 1)) * BLK;
@@ -224,28 +232,25 @@ extern "C" {
 // The step's GEMMs, in order: per layer QKV for every row group, O for every
 // group, gate/up for every group, down for every group; then the heads for
 // every group. ctl (read by the design's loops): chunks of the K slice, output
-// units, groups (of 32 columns) per unit, RMSNorm, gamma object (tails, once
-// per layer), x tiles per unit (tails), attention after the phase, A tiles per
-// chunk, rope object (tails).
-enum { EPI_QKV = 0, EPI_RES = 1, EPI_SCALE = 2, EPI_LOGITS = 3 };
-enum { CTL_ATT = 6, CTL_GAMMA = 4 };
+// units, groups (of 32 columns) per unit, RMSNorm, -, x tiles per unit
+// (tails), QKV post-pass + attention after the phase, A tiles per chunk.
+enum { EPI_RES = 1, EPI_SCALE = 2, EPI_LOGITS = 3 };
+enum { CTL_ATT = 6 };
 
 void SYM(og_phase)(int32_t *ctl, uint8_t *st, int32_t nl, int32_t ng) {
-  static const int32_t T[5][9] = {
-      // nch units gpu norm gamma x attn parts rope
-      {1, 32, 4, 1, 0, 0, 0, 1, 1},   // QKV
-      {2, 8, 4, 0, 0, 1, 0, 1, 0},    // O (+ residual)
-      {1, 48, 4, 1, 0, 0, 0, 1, 0},   // gate / up, normed, as tiles (gate unit, up unit, ...)
-      {3, 8, 4, 0, 0, 1, 0, 2, 0},    // down (+ residual); A = silu(gate) * up, made on load
-      {1, 129, 2, 1, 0, 0, 0, 1, 0}}; // audio heads (64 columns per object)
-  static const int32_t EPI[5] = {EPI_QKV, EPI_RES, EPI_SCALE, EPI_RES, EPI_LOGITS};
+  static const int32_t T[5][8] = {
+      // nch units gpu norm - x attn parts
+      {1, 32, 4, 1, 0, 0, 0, 1},   // QKV, normed (q/k-norm, RoPE: the post-pass)
+      {2, 8, 4, 0, 0, 1, 0, 1},    // O (+ residual)
+      {1, 48, 4, 1, 0, 0, 0, 1},   // gate / up, normed, as tiles (gate unit, up unit, ...)
+      {3, 8, 4, 0, 0, 1, 0, 2},    // down (+ residual); A = silu(gate) * up, made on load
+      {1, 129, 2, 1, 0, 0, 0, 1}}; // audio heads (64 columns per object)
+  static const int32_t EPI[5] = {EPI_SCALE, EPI_RES, EPI_SCALE, EPI_RES, EPI_LOGITS};
   int32_t *pc = (int32_t *)(st + OFF_PC);
   const int g = pc[0], kind = pc[2] < nl ? pc[1] : 4;
-  NOUNROLL for (int f = 0; f < 9; f++) ctl[f] = T[kind][f];
-  ctl[CTL_GAMMA] = kind == 0 && g == 0;
+  NOUNROLL for (int f = 0; f < 8; f++) ctl[f] = T[kind][f];
   ctl[CTL_ATT] = kind == 0 && g == ng - 1;
   *(int32_t *)(st + OFF_EPI) = EPI[kind];
-  *(int32_t *)(st + OFF_UNIT) = 0;
   if (++pc[0] == ng) {
     pc[0] = 0;
     if (++pc[1] == 4) {
@@ -265,15 +270,7 @@ void SYM(oc_params)(const uint8_t *obj, uint8_t *st) {
 }
 
 #ifdef OMNI_TAIL
-void SYM(oc_take_rope)(const uint8_t *obj, uint8_t *st) { copy_tile(obj, st + OFF_ROPE); }
 void SYM(oc_take_x)(const uint8_t *obj, uint8_t *st) { copy_tile(obj, st + OFF_X); }
-
-// gamma_q, gamma_k as bf16 [256] at the start of the object
-void SYM(oc_take_gamma)(const uint8_t *obj, uint8_t *st) {
-  const v32bfloat16 *s = (const v32bfloat16 *)obj;
-  v32bfloat16 *d = (v32bfloat16 *)(st + OFF_GAMMA);
-  NOUNROLL for (int i = 0; i < 8; i++) d[i] = s[i];
-}
 #endif
 
 // ------------------------------------------------------------------ GEMM
@@ -289,8 +286,8 @@ static inline ACC silu(VB64 g) {
 
 // Chunk ch of the core's A slice into abuf: one tile, or (parts = 2, the down
 // GEMM) a gate tile then an up tile, from which the chunk is silu(gate) * up.
-// The gate tile waits in the region past the GEMM state (attention scratch on
-// the other cores, the epilogue stash on the tails: neither is live here).
+// The gate tile waits in the region past the GEMM state (attention scratch;
+// on the tails the x tile, taken only after the loads).
 constexpr int OFF_GTMP = ST_BODY;
 void SYM(og_load)(const uint8_t *tile, uint8_t *st, int32_t ch, int32_t part, int32_t parts) {
   if (parts == 2 && part == 0) {
@@ -394,31 +391,7 @@ static inline VB64 rstd_bf(const uint8_t *st, int rb) {
   return aie::load_v<64>((const bfloat16 *)(st + OFF_RSTD) + rb * 64);
 }
 
-static inline bfloat16 *stash(uint8_t *st, int rb, int cb) {
-  return (bfloat16 *)(st + OFF_STASH) + (rb * 16 + cb) * 64;
-}
-
 static inline VB64 scaled(ACC a, VB64 r) { return aie::mul(a.template to_vector<bfloat16>(), r).template to_vector<bfloat16>(); }
-
-static inline BV bfp(ACC a) { return a.template to_vector<bfp16ebs8>(); }
-
-static inline BV bfp(VB64 v) {
-  ACC a;
-  a.from_vector(v);
-  return a.template to_vector<bfp16ebs8>();
-}
-
-// RoPE of the q/k head's column blocks ca (< 8) and ca + 8 of row block rb:
-// a = y_ca gamma_ca, b = y_cb gamma_cb, then (a cos - b sin, b cos + a sin)
-static inline void rope_blk(uint8_t *st, const bfloat16 *gamma, int rb, int ca, VB64 yb) {
-  const uint8_t *rope = st + OFF_ROPE;
-  const VB64 a = aie::mul(aie::load_v<64>(stash(st, rb, ca)), cols8(aie::load_v<8>(gamma + ca * 8))).template to_vector<bfloat16>();
-  const VB64 b = aie::mul(yb, cols8(aie::load_v<8>(gamma + 64 + ca * 8))).template to_vector<bfloat16>();
-  const VB64 c = decode(tile_blk(rope, rb, ca)).template to_vector<bfloat16>();
-  const VB64 sn = decode(tile_blk(rope, rb, ca + 8)).template to_vector<bfloat16>();
-  aie::store_v(stash(st, rb, ca), aie::msc(aie::mul(a, c), b, sn).template to_vector<bfloat16>());
-  aie::store_v(stash(st, rb, ca + 8), aie::mac(aie::mul(b, c), a, sn).template to_vector<bfloat16>());
-}
 
 // The epilogue of a quarter of group g's sums (row blocks 2p, 2p + 1 x column
 // blocks 2q, 2q + 1 of the group), as the last chunk's mac leaves them in
@@ -427,9 +400,6 @@ static inline void rope_blk(uint8_t *st, const bfloat16 *gamma, int rb, int ca, 
 //   O, down       y = x + a (x: this unit's tile of the residual), the same
 //   heads         y = a * rstd, bf16 8x8 blocks [g % 2][4 rb][4 nb][64] (the
 //                 unit's object carries both groups, its first 4 KB)
-//   QKV           y = a * rstd into the stash; q/k heads also sum y^2 per row
-//                 and, from group 2 on, apply gamma and RoPE to the column
-//                 block pairs (og_emit applies the q/k-norm)
 static inline void epi_pq(uint8_t *st, uint8_t *o, int e, int g, int p, int q, ACC a00, ACC a01, ACC a10, ACC a11) {
   const int rb = 2 * p, nb = 2 * q, cb = 4 * (g & 3) + nb;
   if (e == EPI_RES) {
@@ -441,11 +411,6 @@ static inline void epi_pq(uint8_t *st, uint8_t *o, int e, int g, int p, int q, A
   }
   const VB64 r0 = rstd_bf(st, rb), r1 = rstd_bf(st, rb + 1);
   const VB64 y00 = scaled(a00, r0), y01 = scaled(a01, r0), y10 = scaled(a10, r1), y11 = scaled(a11, r1);
-  if (e == EPI_SCALE) {
-    BO out((bfp16ebs8 *)(o + (p * 16 + cb) * 2 * BLK));
-    out << bfp(y00) << bfp(y10) << bfp(y01) << bfp(y11);
-    return;
-  }
   if (e == EPI_LOGITS) {
     bfloat16 *d = (bfloat16 *)o + (g & 1) * 1024 + (rb * 4 + nb) * 64;
     aie::store_v(d, y00);
@@ -454,35 +419,12 @@ static inline void epi_pq(uint8_t *st, uint8_t *o, int e, int g, int p, int q, A
     aie::store_v(d + 320, y11);
     return;
   }
-  const int u = *(const int32_t *)(st + OFF_UNIT);
-#ifdef SKIP_QKNORM
-  if (u < 24) {
-    BO out((bfp16ebs8 *)(o + (p * 16 + cb) * 2 * BLK));
-    out << bfp(y00) << bfp(y10) << bfp(y01) << bfp(y11);
-    return;
-  }
-#endif
-  if (u < 24) {
-    float *ss = (float *)(st + OFF_SS) + rb * 64;
-    const bool fresh = g == 0 && q == 0;
-    ACC s0 = fresh ? aie::zeros<accfloat, 64>() : load_acc(ss), s1 = fresh ? aie::zeros<accfloat, 64>() : load_acc(ss + 64);
-    aie::store_v(ss, aie::mac(aie::mac(s0, y00, y00), y01, y01).template to_vector<float>());
-    aie::store_v(ss + 64, aie::mac(aie::mac(s1, y10, y10), y11, y11).template to_vector<float>());
-    if (g >= 2) {
-      const bfloat16 *gamma = (const bfloat16 *)(st + OFF_GAMMA) + (u < 16 ? 0 : 128);
-      rope_blk(st, gamma, rb, cb - 8, y00);
-      rope_blk(st, gamma, rb, cb - 7, y01);
-      rope_blk(st, gamma, rb + 1, cb - 8, y10);
-      rope_blk(st, gamma, rb + 1, cb - 7, y11);
-      return;
-    }
-  }
-  aie::store_v(stash(st, rb, cb), y00);
-  aie::store_v(stash(st, rb, cb + 1), y01);
-  aie::store_v(stash(st, rb + 1, cb), y10);
-  aie::store_v(stash(st, rb + 1, cb + 1), y11);
+  BO out((bfp16ebs8 *)(o + (p * 16 + cb) * 2 * BLK));
+  out << bfp(y00) << bfp(y10) << bfp(y01) << bfp(y11);
 }
 #endif
+
+// one group's (g) chunk ch of nch#endif
 
 // one group's (g) chunk ch of nch: acc [4 rb][4 nb] += A[:, chunk ch] x W^T
 #ifdef OMNI_TAIL
@@ -543,39 +485,65 @@ void SYM(og_mac)(const uint8_t *b, uint8_t *st, int32_t ch, int32_t nch, int32_t
 }
 
 #ifdef OMNI_TAIL
-// The unit's output tile, after its groups' epilogues: QKV q/k heads get
-// their q/k-norm (1 / sqrt(mean of squares + eps) per row; sqrt(128) is folded
-// into gamma by the host), v heads (u >= 24) are written transposed (V^T tile);
-// every other phase's epilogue already wrote the tile.
-void SYM(og_emit)(uint8_t *out, uint8_t *st, int32_t u_) {
-  int32_t *up = (int32_t *)(st + OFF_UNIT);
-  const int u = *up;
-  *up = u + 1;
-  if (*(const int32_t *)(st + OFF_EPI) != EPI_QKV)
-    return;
-#ifdef SKIP_QKNORM
-  if (u < 24)
-    return;
-#endif
+#endif // OMNI_TAIL
+
+// ------------------------------------------------------------------ QKV post-pass
+// Per layer: gamma q | k (bf16 [256], times sqrt(128): the q/k-norm below is
+// 1 / sqrt(sum + 128 eps)), then per row group the RoPE tile of the core's row
+// block and its tiles.
+void SYM(qp_gamma)(const uint8_t *obj, uint8_t *st) {
+  const v32bfloat16 *s = (const v32bfloat16 *)obj;
+  v32bfloat16 *d = (v32bfloat16 *)(st + OFF_QG);
+  NOUNROLL for (int i = 0; i < 8; i++) d[i] = s[i];
+}
+
+void SYM(qp_rope)(const uint8_t *obj, uint8_t *st) { copy_tile(obj, st + OFF_QR); }
+
+// A q (k = 0) or k (k = 1) head tile: per row 1 / rms (the diagonal of Y Y^T
+// over the 16 column blocks), gamma, RoPE on column block pairs (cb, cb + 8),
+// a row pair at a time into OFF_QT, then the pair's 32 blocks in tile order.
+void SYM(qp_qk)(const uint8_t *in, uint8_t *out, uint8_t *st, int32_t k) {
+  const bfloat16 *gamma = (const bfloat16 *)(st + OFF_QG) + (k ? 128 : 0);
+  const uint8_t *rope = st + OFF_QR;
+  bfloat16 *tmp = (bfloat16 *)(st + OFF_QT);
   BO o((bfp16ebs8 *)out);
-  if (u >= 24) {
-    NOUNROLL for (int i = 0; i < 64; i++)
-      o << bfp(aie::transpose(aie::load_v<64>(stash(st, i & 3, i >> 2)), 8, 8));
-    return;
-  }
-  bfloat16 *rq = (bfloat16 *)(st + OFF_RQ);
-  NOUNROLL for (int rb = 0; rb < 4; rb++) {
-    V64 tot = row_sums(load_acc((const float *)(st + OFF_SS) + rb * 64)).template to_vector<float>();
-    alignas(64) float rr[8];
-    NOUNROLL for (int i = 0; i < 8; i++) rr[i] = invsqrt(tot[i * 8] + 128 * EPS);
-    aie::store_v(rq + rb * 64, to_bf(rows8(aie::load_v<8>(rr))));
-  }
-  NOUNROLL for (int i = 0; i < 64; i++) {
-    const int rb = 2 * (i >> 5) + (i & 1), kb = (i >> 1) & 15;
-    o << bfp(aie::mul(aie::load_v<64>(stash(st, rb, kb)), aie::load_v<64>(rq + rb * 64)));
+  NOUNROLL for (int p = 0; p < 2; p++) {
+    NOUNROLL for (int j = 0; j < 2; j++) {
+      const int rb = 2 * p + j;
+      ACC d = aie::zeros<accfloat, 64>();
+      NOUNROLL for (int cb = 0; cb < 16; cb++) {
+        const BV y = load_blk(tile_blk(in, rb, cb));
+        d = mac(d, y, y);
+      }
+      const V64 v = d.template to_vector<float>();
+      alignas(64) float rr[8];
+      NOUNROLL for (int i = 0; i < 8; i++) rr[i] = invsqrt(v[i * 9] + 128 * EPS);
+      const VB64 r = to_bf(rows8(aie::load_v<8>(rr)));
+      bfloat16 *t = tmp + j * 16 * 64;
+      NOUNROLL for (int cb = 0; cb < 8; cb++) {
+        const VB64 a = aie::mul(decode(tile_blk(in, rb, cb)).template to_vector<bfloat16>(),
+                                cols8(aie::load_v<8>(gamma + cb * 8))).template to_vector<bfloat16>();
+        const VB64 b = aie::mul(decode(tile_blk(in, rb, cb + 8)).template to_vector<bfloat16>(),
+                                cols8(aie::load_v<8>(gamma + 64 + cb * 8))).template to_vector<bfloat16>();
+        const VB64 c = decode(tile_blk(rope, rb, cb)).template to_vector<bfloat16>();
+        const VB64 sn = decode(tile_blk(rope, rb, cb + 8)).template to_vector<bfloat16>();
+        const VB64 ra = aie::msc(aie::mul(a, c), b, sn).template to_vector<bfloat16>();
+        const VB64 rbv = aie::mac(aie::mul(b, c), a, sn).template to_vector<bfloat16>();
+        aie::store_v(t + cb * 64, aie::mul(ra, r).template to_vector<bfloat16>());
+        aie::store_v(t + (cb + 8) * 64, aie::mul(rbv, r).template to_vector<bfloat16>());
+      }
+    }
+    NOUNROLL for (int i = 0; i < 32; i++)
+      o << bfp(aie::load_v<64>(tmp + ((i & 1) * 16 + (i >> 1)) * 64));
   }
 }
-#endif // OMNI_TAIL
+
+// A V tile (rows = keys) as a V^T tile [16 db][4 kb][72] (rows d, columns keys)
+void SYM(qp_v)(const uint8_t *in, uint8_t *out, uint8_t *st) {
+  BO o((bfp16ebs8 *)out);
+  NOUNROLL for (int i = 0; i < 64; i++)
+    o << bfp(aie::transpose(decode(tile_blk(in, i & 3, i >> 2)).template to_vector<bfloat16>(), 8, 8));
+}
 
 // ------------------------------------------------------------------ attention
 // One work item: 32 query rows of one head against the keys of their
@@ -602,19 +570,32 @@ void SYM(oa_k)(const uint8_t *kt, uint8_t *st, int32_t kb, int32_t s, int32_t j)
 #ifdef SKIP_ATT
   return;
 #endif
-  const int kvlen = ((const int32_t *)(st + OFF_KVLEN))[s] - j * 32 * NKB;
-  const uint8_t *q = st + OFF_AQ;
+  const int kvlen = ((const int32_t *)(st + OFF_KVLEN))[s] - j * 32 * NKB - kb * 32;
   bfloat16 *sc = (bfloat16 *)(st + OFF_AS);
-  NOUNROLL for (int i = 0; i < 16; i++) {
-    const int qb = i >> 2, k8 = i & 3;
-    ACC c = aie::zeros<accfloat, 64>();
-    for (int db = 0; db < 16; db++)
-      c = mac(c, load_blk(tile_blk(q, qb, db)), load_blk(tile_blk(kt, k8, db)));
+  // as og_mac: a query row pair x a key row pair per pass, 2 x 2 blocks
+  NOUNROLL for (int pq = 0; pq < 4; pq++) {
+    const int p = pq >> 1, kp = pq & 1;
+    BS qs((const bfp16ebs8 *)(st + OFF_AQ + p * TILE_PAIR));
+    BS ks((const bfp16ebs8 *)(kt + kp * TILE_PAIR));
+    ACC c00 = aie::zeros<accfloat, 64>(), c01 = c00, c10 = c00, c11 = c00;
+    PIPE4 for (int db = 0; db < 16; db++) {
+      BV q0, q1, k0, k1;
+      qs >> q0 >> q1;
+      ks >> k0 >> k1;
+      c00 = mac(c00, q0, k0);
+      c01 = mac(c01, q0, k1);
+      c10 = mac(c10, q1, k0);
+      c11 = mac(c11, q1, k1);
+    }
     // keys past kvlen do not exist (branch-free: a branch here trips Peano's
     // early if-conversion)
-    VB64 v = aie::select(aie::broadcast<bfloat16, 64>(bfloat16(NEG)), c.template to_vector<bfloat16>(),
-                         first_cols(kvlen - (kb * 32 + k8 * 8)));
-    aie::store_v(sc + (qb * 4 * NKB + kb * 4 + k8) * 64, v);
+    const VB64 neg = aie::broadcast<bfloat16, 64>(bfloat16(NEG));
+    const aie::mask<64> m0 = first_cols(kvlen - 16 * kp), m1 = first_cols(kvlen - 16 * kp - 8);
+    bfloat16 *d = sc + ((2 * p) * 4 * NKB + kb * 4 + 2 * kp) * 64;
+    aie::store_v(d, aie::select(neg, c00.template to_vector<bfloat16>(), m0));
+    aie::store_v(d + 64, aie::select(neg, c01.template to_vector<bfloat16>(), m1));
+    aie::store_v(d + 4 * NKB * 64, aie::select(neg, c10.template to_vector<bfloat16>(), m0));
+    aie::store_v(d + 4 * NKB * 64 + 64, aie::select(neg, c11.template to_vector<bfloat16>(), m1));
   }
 }
 
@@ -676,33 +657,35 @@ void SYM(oa_v)(const uint8_t *vt, uint8_t *st, int32_t kb, int32_t j) {
 #ifdef SKIP_ATT
   return;
 #endif
-  float *o = (float *)(st + OFF_AO);
   const uint8_t *pb = st + OFF_AP;
   const bool rescale = kb == 0 && j > 0;
   NOUNROLL for (int qb = 0; qb < 4; qb++) {
     const uint8_t *pq = pb + (qb * 4 * NKB + kb * 4) * BLK;
     BV p0 = load_blk(pq), p1 = load_blk(pq + BLK), p2 = load_blk(pq + 2 * BLK), p3 = load_blk(pq + 3 * BLK);
     const VB64 f = aie::load_v<64>((const bfloat16 *)(st + OFF_AF) + qb * 64);
-    if (rescale) {
-      NOUNROLL for (int db = 0; db < 16; db++) {
-        float *op = o + (qb * 16 + db) * 64;
-        BS vs((const bfp16ebs8 *)(vt + db * 4 * BLK));
-        BV v0, v1, v2, v3;
-        vs >> v0 >> v1 >> v2 >> v3;
-        ACC c = scale_acc(load_acc(op), f);
-        c = mac(mac(mac(mac(c, p0, v0), p1, v1), p2, v2), p3, v3);
-        aie::store_v(op, c.template to_vector<float>());
+    float *op = (float *)(st + OFF_AO) + qb * 16 * 64;
+    BS vs((const bfp16ebs8 *)vt);
+    // two d blocks per pass, their chains interleaved (one chain alone waits on
+    // the MAC latency), loads before stores
+    NOUNROLL for (int d2 = 0; d2 < 8; d2++) {
+      ACC c0 = load_acc(op), c1 = load_acc(op + 64);
+      if (rescale) {
+        c0 = scale_acc(c0, f);
+        c1 = scale_acc(c1, f);
       }
-    } else {
-      NOUNROLL for (int db = 0; db < 16; db++) {
-        float *op = o + (qb * 16 + db) * 64;
-        BS vs((const bfp16ebs8 *)(vt + db * 4 * BLK));
-        BV v0, v1, v2, v3;
-        vs >> v0 >> v1 >> v2 >> v3;
-        ACC c = load_acc(op);
-        c = mac(mac(mac(mac(c, p0, v0), p1, v1), p2, v2), p3, v3);
-        aie::store_v(op, c.template to_vector<float>());
-      }
+      BV a0, a1, a2, a3, b0, b1, b2, b3;
+      vs >> a0 >> a1 >> a2 >> a3 >> b0 >> b1 >> b2 >> b3;
+      c0 = mac(c0, p0, a0);
+      c1 = mac(c1, p0, b0);
+      c0 = mac(c0, p1, a1);
+      c1 = mac(c1, p1, b1);
+      c0 = mac(c0, p2, a2);
+      c1 = mac(c1, p2, b2);
+      c0 = mac(c0, p3, a3);
+      c1 = mac(c1, p3, b3);
+      aie::store_v(op, c0.template to_vector<float>());
+      aie::store_v(op + 64, c1.template to_vector<float>());
+      op += 128;
     }
   }
 }

@@ -68,7 +68,7 @@ def reference(model, x, NL):
         wqkv, wo, wg, wu, wd = (bfp16(torch.from_numpy(w)) for w in (wqkv, wo, wg, wu, wd))
         gq, gk = torch.from_numpy(gamma[:128]), torch.from_numpy(gamma[128:])
         r = torch.rsqrt(xr.pow(2).mean(-1, keepdim=True) + eps)
-        heads = bf16((xr @ wqkv.T) * r).view(n, 32, 128)
+        heads = bfp16(bf16((xr @ wqkv.T) * r)).view(n, 32, 128)       # the QKV GEMM's tiles
 
         def norm_rope(h, g):
             h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps) * g
@@ -78,7 +78,7 @@ def reference(model, x, NL):
 
         q = norm_rope(heads[:, :16], gq)
         k = norm_rope(heads[:, 16:24], gk)
-        v = heads[:, 24:]                                             # bf16
+        v = heads[:, 24:]                                             # bfp16 along d
         vt = bfp16(v.transpose(0, 2)).transpose(0, 2)                 # groups of 8 keys
         o = torch.zeros(n, 16, 128)
         for h in range(16):
@@ -111,8 +111,10 @@ def npu_intermediates(eng):
     NG = eng.NG
     reg = lambda name, n: np.stack([eng.region(name, n, g) for g in range(NG)])   # noqa: E731
     out = {}
-    out["q"] = seq_rows(H.untile(reg("Q", 64).reshape(NG, 16, 4, H.TILE)), NG).reshape(2, -1, 16, 128)
-    kv = reg("KV", 64).reshape(NG, 8, 2, 2, 2, H.TILE)                # [g, c, s, K/V, r2]
+    qr = reg("QR", 160).reshape(NG, 8, S.QR_COL, H.TILE)               # [g, c, tile]
+    q = qr[:, :, S.QR_Q:S.QR_Q + 8].reshape(NG, 16, 4, H.TILE)         # heads 2c, 2c + 1
+    out["q"] = seq_rows(H.untile(q), NG).reshape(2, -1, 16, 128)
+    kv = qr[:, :, S.QR_KV:S.QR_KV + 8].reshape(NG, 8, 2, 2, 2, H.TILE)   # [g, c, s, K/V, r2]
     k = H.untile(kv[:, :, :, 0])                                      # [g, c, s, r2, 32, 128]
     out["k"] = k.transpose(2, 0, 3, 4, 1, 5).reshape(2, NG * 64, 8, 128)
     v = np.stack([H.untile_vt(t) for t in kv[:, :, :, 1].reshape(-1, H.TILE)]).reshape(NG, 8, 2, 2, 32, 128)

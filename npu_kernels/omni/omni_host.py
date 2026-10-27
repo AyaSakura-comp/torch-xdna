@@ -255,7 +255,11 @@ class Engine:
         a[:] = 0
         llm = model.llm
         for g in range(NG):
-            a[self.L["ROPE", g]:self.L["ROPE", g] + 4] = rope_tiles(llm.rotary_emb.inv_freq.float().numpy(), g)
+            # every column's copy of the group's RoPE tiles (its QKV post-pass input)
+            rt = rope_tiles(llm.rotary_emb.inv_freq.float().numpy(), g)
+            for c in range(S.NCOL):
+                q0 = self.L["QR", g] + S.QR_COL * c
+                a[q0:q0 + 4] = rt
         for L in range(NL):
             # q/k-norm gamma times sqrt(128) (omni_core.cc emit_qkv)
             g = layer_weights(llm.layers[L])[-1].astype(np.float32) * np.float32(np.sqrt(128.0))

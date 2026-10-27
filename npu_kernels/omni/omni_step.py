@@ -8,12 +8,13 @@ moves 4608-byte tiles (32 rows x 128 columns of bfp16) between DDR and the cores
             memtile c to column c's 4 cores, one contiguous run per column per GEMM and row
             group; the tails (column 7) apply the epilogue and write one output tile per 128
             columns:
-              QKV      RMSNorm (sums of squares passed along the chain), q/k-norm + RoPE,
-                       V transposed for the attention
+              QKV      RMSNorm (sums of squares passed along the chain)
               O, down  + the residual
               gate/up  RMSNorm; gate and up as separate units (h = silu(gate) * up is made
                        by the down GEMM's cores as they load their A slice)
               heads    final norm, logits
+  QKV post  every core: q/k-norm + gamma + RoPE of its row block of q heads 2c, 2c + 1 and of
+            kv head c's K (rows 0, 1) or the V -> V^T transpose (rows 2, 3), back to DDR
   attention column c runs kv head c for both sequences; its 4 cores take the 2 query heads x
             2 query blocks of a row group at a time; q arrives on A, the shared K / V^T of
             every row group on the weights' broadcast (B), an online softmax runs over them
@@ -23,12 +24,13 @@ blocks 2, 3: the same positions); every GEMM runs once per group (its weights st
 times), keys past each sequence's length are masked.
 
 DDR (one activation buffer, tiles of 4608 bytes): PARAMS 1 | GAMMA NL | then per row group
-  ATT 64 | X 32 | ROPE 4 | GU 192 | X1 32 | Q 64 | KV 64
-  layouts [unit][row block] (GU: [24][gate, up][row block]; KV: [kv head][sequence][K, V^T]
-  [key block]); each tail's A run of a phase is contiguous (X unit 7 + ROPE, ATT heads 14-15
-  + X, GU block 21-23 + X1). Weights per column, per layer: QKV 128, O 64, GU 192, down 96
-  objects, then the heads' 258; logits: [group][unit 129][row block 4] objects, bf16 [32][64]
-  each.
+  ATT 64 | X 32 | GU 192 | X1 32 | QR 160
+  layouts [unit][row block] (GU: [24][gate, up][row block]); QR, per column c: RoPE [row
+  block] 4 | q heads 2c, 2c + 1 [row block] 8 | kv head c [sequence][K, V^T][key block] 8,
+  so a column's post-pass input is one run per group; each tail's A run of a phase is
+  contiguous (ATT heads 14-15 + X, GU block 21-23 + X1). Weights per column, per layer: QKV
+  128, O 64, GU 192, down 96 objects, then the heads' 258; logits: [group][unit 129][row
+  block 4] objects, bf16 [32][64] each.
 """
 
 import json
@@ -48,7 +50,8 @@ NHEAD = 8 * 1025               # audio heads: 8 codebooks x 1025
 NHEAD_P = 129 * 64             # padded to whole units of 64 columns
 HEAD_W = NHEAD_P // 32         # weight objects of the heads per column (258)
 HEAD_U = NHEAD_P // 64         # output units of the heads (129)
-GROUP = (("ATT", 64), ("X", 32), ("ROPE", 4), ("GU", 192), ("X1", 32), ("Q", 64), ("KV", 64))
+GROUP = (("ATT", 64), ("X", 32), ("GU", 192), ("X1", 32), ("QR", 160))
+QR_COL, QR_Q, QR_KV = 20, 4, 12      # QR: tiles per column, offsets of q and of K / V^T
 
 
 class Layout:
@@ -126,7 +129,7 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
     tile_ty = np.ndarray[(TILE,), u8]
     quad_ty = np.ndarray[(NROW * TILE,), u8]
     # per-core state (omni_core.cc: ST_ATTN, ST_TAIL)
-    st_ty = {False: np.ndarray[(29504,), u8], True: np.ndarray[(33344,), u8]}   # ST_ATTN, ST_TAIL
+    st_ty = {False: np.ndarray[(29504,), u8], True: np.ndarray[(29504,), u8]}   # ST_ATTN (>= ST_TAIL)
     ctl_ty = np.ndarray[(16,), np.dtype[np.int32]]
     i32 = np.int32
     tb, tt = st_ty[False], st_ty[True]
@@ -139,13 +142,16 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
                     mac=kb_("og_mac", tile_ty, tb, i32, i32, i32, i32), oa_q=kb_("oa_q", tile_ty, tb),
                     oa_k=kb_("oa_k", tile_ty, tb, i32, i32, i32), oa_soft=kb_("oa_soft", tb, i32, i32),
                     oa_v=kb_("oa_v", tile_ty, tb, i32, i32),
-                    oa_out=kb_("oa_out", tile_ty, tb)),
+                    oa_out=kb_("oa_out", tile_ty, tb), qp_gamma=kb_("qp_gamma", tile_ty, tb),
+                    qp_rope=kb_("qp_rope", tile_ty, tb), qp_qk=kb_("qp_qk", tile_ty, tile_ty, tb, i32),
+                    qp_v=kb_("qp_v", tile_ty, tile_ty, tb)),
         True: dict(params=kt_("oc_params", tile_ty, tt), phase=kt_("og_phase", ctl_ty, tt, i32, i32),
-                   rope=kt_("oc_take_rope", tile_ty, tt), take_x=kt_("oc_take_x", tile_ty, tt),
-                   gamma=kt_("oc_take_gamma", tile_ty, tt), load=kt_("og_load", tile_ty, tt, i32, i32, i32),
+                   take_x=kt_("oc_take_x", tile_ty, tt), load=kt_("og_load", tile_ty, tt, i32, i32, i32),
                    ssq_tail=kt_("og_ssq_tail", tt, i32),
                    mac=kt_("og_mac", tile_ty, tt, tile_ty, i32, i32, i32, i32),
-                   emit=kt_("og_emit", tile_ty, tt, i32), oa_q=kt_("oa_q", tile_ty, tt),
+                   qp_gamma=kt_("qp_gamma", tile_ty, tt), qp_rope=kt_("qp_rope", tile_ty, tt),
+                   qp_qk=kt_("qp_qk", tile_ty, tile_ty, tt, i32), qp_v=kt_("qp_v", tile_ty, tile_ty, tt),
+                   oa_q=kt_("oa_q", tile_ty, tt),
                    oa_k=kt_("oa_k", tile_ty, tt, i32, i32, i32), oa_soft=kt_("oa_soft", tt, i32, i32),
                    oa_v=kt_("oa_v", tile_ty, tt, i32, i32), oa_out=kt_("oa_out", tile_ty, tt)),
     }
@@ -171,20 +177,10 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
         """One GEMM phase; its counts come from ctl (og_phase), so every phase of the step
         runs this one piece of code."""
         nch = ctl[0]
-        if role == "tail":
-            for _ in range_(ctl[4]):
-                g_ = A.acquire(1)
-                kk["gamma"](g_, st)
-                A.release(1)
         for ch in range_(nch):
             for part in range_(ctl[7]):
                 x = A.acquire(1)
                 kk["load"](x, st, ch, part, ctl[7])
-                A.release(1)
-        if role == "tail":
-            for _ in range_(ctl[8]):
-                r_ = A.acquire(1)
-                kk["rope"](r_, st)
                 A.release(1)
         for _ in range_(ctl[3]):
             if role == "head":
@@ -213,7 +209,27 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
                         kk["mac"](w, st, ch, nch, rcode, g)
                     B.release(1)
             if role == "tail":
-                kk["emit"](o, st, u)
+                O.release(1)
+
+    def post(A, O, st, kk, r):
+        """QKV post-pass of column c, core r (row block r): gamma, then per row group the
+        RoPE tile, q heads 2c and 2c + 1, and two of kv head c's K / V tiles (rows 0, 1:
+        K of sequences 0, 1 -> q/k-norm + RoPE; rows 2, 3: V -> V^T)."""
+        g_ = A.acquire(1)
+        kk["qp_gamma"](g_, st)
+        A.release(1)
+        for _ in range_(NG):
+            rt = A.acquire(1)
+            kk["qp_rope"](rt, st)
+            A.release(1)
+            for i in range(4):
+                x = A.acquire(1)
+                y = O.acquire(1)
+                if i < 2 or r < 2:
+                    kk["qp_qk"](x, y, st, 0 if i < 2 else 1)
+                else:
+                    kk["qp_v"](x, y, st)
+                A.release(1)
                 O.release(1)
 
     def attention(A, B, O, st, kk):
@@ -239,7 +255,7 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
                 kk["oa_out"](o, st)
                 O.release(1)
 
-    def make_body(c):
+    def make_body(c, r):
         role = "head" if c == 0 else "tail" if c == NCOL - 1 else "mid"
 
         def body(A, B, *rest):
@@ -254,6 +270,7 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
                 gemm(role, A, B, O, st, ctl, kk)
                 if att[c]:
                     for _ in range_(ctl[6]):
+                        post(A, O, st, kk, r)
                         attention(A, B, O, st, kk)
 
         return body
@@ -272,7 +289,7 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
             # FIFO depths, which does not fit the tails' 16 KB of program memory); the
             # stack is set by hand: aiecc's measurement falls back to 1 KB for the tails,
             # whose output epilogue alone has a 3.4 KB frame
-            row.append(Worker(make_body(c), args, tile=Tile(c, 2 + r), stack_size=0x1000,
+            row.append(Worker(make_body(c, r), args, tile=Tile(c, 2 + r), stack_size=0x1000,
                               dynamic_objfifo_lowering=True))
         for w0, w1 in zip(row, row[1:]):
             CascadeFlow(w0, w1)
@@ -307,17 +324,16 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
             weights(c, 0, W_QKV, wq)
         for layer in range(NL):
             base = layer * wl
-            # QKV (per group): chunk = X unit c; tails: gamma (once), then unit 7 + the
-            # group's RoPE tiles. Out: q heads, K heads, V^T heads per group
-            ap[7].fill(Ai, tap(act_len, L["GAMMA"] + layer, [(NROW, 0)]), group=tg)
+            # QKV (per group): chunk = X unit c. Out per group: q heads (column c's pair),
+            # K heads, V heads into QR
             for c in range(NCOL):
-                ap[c].fill(Ai, per_group("X", 4 * c, 4 if c < NCOL - 1 else 8), group=tg)
+                ap[c].fill(Ai, per_group("X", 4 * c, 4), group=tg)
             prev = None
             for g in range(NG):
                 dg = TaskGroup()
-                oc[7].drain(Ai, tap(act_len, L["Q", g], [(64, 1)]), group=dg)
+                oc[7].drain(Ai, tap(act_len, L["QR", g] + QR_Q, [(NCOL, QR_COL), (8, 1)]), group=dg)
                 for v in range(2):
-                    oc[7].drain(Ai, tap(act_len, L["KV", g] + 2 * v, [(8, 8), (2, 4), (2, 1)]),
+                    oc[7].drain(Ai, tap(act_len, L["QR", g] + QR_KV + 2 * v, [(NCOL, QR_COL), (2, 4), (2, 1)]),
                                 wait=v == 1, group=dg)
                 if prev is not None:
                     prev.finish()
@@ -325,6 +341,17 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
             prev.finish()
             tg.finish()
             wq.finish()
+            # QKV post-pass: per column the layer's gamma, then per group its QR run (RoPE,
+            # q heads, K / V); back to the same places
+            tg = TaskGroup()
+            for c in range(NCOL):
+                if att[c]:
+                    ap[c].fill(Ai, tap(act_len, L["GAMMA"] + layer, [(NROW, 0)]), group=tg)
+                    ap[c].fill(Ai, per_group("QR", QR_COL * c, QR_COL), group=tg)
+            for c in range(NCOL):
+                if att[c]:
+                    oc[c].drain(Ai, per_group("QR", QR_COL * c + QR_Q, QR_COL - QR_Q), wait=True, group=tg)
+            tg.finish()
             # attention, column c = kv head c, per sequence s: per round (row group) q of
             # heads 2c, 2c+1 x query blocks 2s, 2s+1 on A; per round all groups' K, V^T
             # tiles on B. Then the drains, and only then the rest of the layer's weights
@@ -333,12 +360,12 @@ def design(ACT, W, LOG, *, NL, NG, obj_body, obj_tail, trace=0):
             for s_ in range(2):
                 for c in range(NCOL):
                     if att[c]:
-                        ap[c].fill(Ai, tap(act_len, L["Q", 0] + 2 * c * 4 + 2 * s_, [(NG, GS), (2, 4), (2, 1)]),
-                                   group=tg)
+                        ap[c].fill(Ai, tap(act_len, L["QR", 0] + QR_COL * c + QR_Q + 2 * s_,
+                                           [(NG, GS), (2, 4), (2, 1)]), group=tg)
                 for c in range(NCOL):
                     if att[c]:
-                        bp[c].fill(Ai, tap(act_len, L["KV", 0] + 8 * c + 4 * s_, [(NG, 0), (NG, GS), (4, 1)]),
-                                   group=tg)
+                        bp[c].fill(Ai, tap(act_len, L["QR", 0] + QR_COL * c + QR_KV + 4 * s_,
+                                           [(NG, 0), (NG, GS), (4, 1)]), group=tg)
             for s_ in range(2):
                 for c in range(NCOL):
                     if att[c]:
