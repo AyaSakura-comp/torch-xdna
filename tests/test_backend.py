@@ -330,9 +330,118 @@ def case_conv_silent_wrong():
     print(f"PASS conv silent wrong -> {s['fallbacks'][0][1][:70]}...; c3 on the CPU, rel err vs fp32 {e:.4f}")
 
 
+class Stack(torch.nn.Module):
+    """A Qwen3Model of Qwen3-0.6B's widths (2 layers) into a linear head, fed embeddings and a 4-D
+    attention mask: OmniVoice's backbone in miniature."""
+
+    def __init__(self, bias=False):
+        super().__init__()
+        from transformers import Qwen3Config, Qwen3Model
+
+        cfg = Qwen3Config(hidden_size=1024, intermediate_size=3072, num_hidden_layers=2, num_attention_heads=16,
+                          num_key_value_heads=8, head_dim=128, vocab_size=16, rms_norm_eps=1e-6,
+                          rope_parameters={"rope_type": "default", "rope_theta": 1e6}, attn_implementation="sdpa")
+        self.llm = Qwen3Model(cfg)
+        self.head = torch.nn.Linear(1024, 1000, bias=bias)
+
+    def forward(self, x, mask):
+        return self.head(self.llm(inputs_embeds=x, attention_mask=mask)[0])
+
+
+def prefix_mask(lens, L):
+    """Sequence b's first n positions see those n; the padding after them sees itself (OmniVoice's)."""
+    m = torch.zeros(len(lens), 1, L, L, dtype=torch.bool)
+    for b, n in enumerate(lens):
+        m[b, :, :n, :n] = True
+        i = torch.arange(n, L)
+        m[b, :, i, i] = True
+    return m
+
+
+STACK = "qwen3 stack 2 layers -> 1000"
+# GEMMs of the plain graph stay on the CPU without timing the NPU (keeps these cases quick)
+CPU_GEMMS = {"min_macs": 1 << 62}
+
+
+def _stack_op():
+    if not torch_xdna.npu_available():
+        print("SKIP stack: no NPU:", torch_xdna.kernels.unavailable_reason())
+        return False
+    from torch_xdna import stack
+
+    if stack._op_module() is None:
+        print("SKIP stack: this Triton-XDNA has no tl.extra.npu.qwen3_stack")
+        return False
+    return True
+
+
+def case_stack():
+    """A Qwen3 stack + head runs as one NPU launch per pair of sequences, close to fp32 eager, padding
+    rows zero; a causal mask and sequences past 384 positions run the plain graph."""
+    if not _stack_op():
+        return
+    net = Stack(bias=True).eval()
+    torch._dynamo.reset()
+    runtime.stats.reset()
+    m = torch.compile(net, backend="xdna", options=CPU_GEMMS)
+    L, lens = 100, [100, 70, 37]       # three sequences: two launches, the last with a stand-in partner
+    x = torch.randn(3, L, 1024)
+    mask = prefix_mask(lens, L)
+    with torch.no_grad():
+        y, ref = m(x, mask), net(x, mask)
+    s = runtime.stats.as_dict()
+    assert s["stacks"] == {f"{STACK} on npu": 1} and s["npu_launches"] == 2, s
+    assert len(s["checks"]) == 1 and s["checks"][0][1] < 0.08, s["checks"]
+    # bfp16 GEMMs: ~5% over two random layers (see Triton-XDNA's examples/qwen3_stack)
+    e = max(rel_err(y[b, :n], ref[b, :n]) for b, n in enumerate(lens))
+    assert e < 0.08, e
+    assert not y[1, 70:].any() and not y[2, 37:].any(), "padding rows are not zero"
+    causal = torch.tril(torch.ones(L, L, dtype=torch.bool)).expand(3, 1, L, L).contiguous()
+    x3, mask3 = torch.randn(2, 400, 1024), prefix_mask([400, 300], 400)
+    with torch.no_grad():
+        y2, ref2 = m(x, causal), net(x, causal)
+        y3, ref3 = m(x3, mask3), net(x3, mask3)
+    s = runtime.stats.as_dict()
+    assert s["stacks"] == {f"{STACK} on npu": 1, f"{STACK} on cpu": 2}, s["stacks"]
+    e2 = rel_err(y2, ref2)
+    e3 = max(rel_err(y3[0], ref3[0]), rel_err(y3[1, :300], ref3[1, :300]))
+    assert e2 < 0.05 and e3 < 0.05, (e2, e3)
+    print(f"PASS stack: 3 sequences in one NPU call (2 launches), rel err vs fp32 {e:.4f} (first-call check "
+          f"{s['checks'][0][1]}); causal mask / 400 positions on the plain graph, rel err {e2:.4f} / {e3:.4f}")
+
+
+def case_stack_silent_wrong():
+    """A stack whose NPU output is wrong fails its first-call check and runs the plain graph from then on."""
+    if not _stack_op():
+        return
+    from triton.language.extra.npu import qwen3_stack as q3
+
+    real = q3.Qwen3Stack.__call__
+
+    def corrupt(self, x0, x1):
+        y0, y1 = real(self, x0, x1)
+        return y0 * 1.5, y1
+
+    q3.Qwen3Stack.__call__ = corrupt
+    net = Stack().eval()
+    torch._dynamo.reset()
+    runtime.stats.reset()
+    m = torch.compile(net, backend="xdna", options=CPU_GEMMS)
+    x, mask = torch.randn(2, 64, 1024), prefix_mask([64, 50], 64)
+    with torch.no_grad():
+        y, ref = m(x, mask), net(x, mask)
+        m(x, mask)
+    s = runtime.stats.as_dict()
+    assert len(s["fallbacks"]) == 1 and "disagrees with the model" in s["fallbacks"][0][1], s["fallbacks"]
+    assert s["stacks"] == {f"{STACK} on cpu": 2}, s["stacks"]
+    e = max(rel_err(y[0], ref[0]), rel_err(y[1, :50], ref[1, :50]))
+    assert e < 0.05, e
+    print(f"PASS stack silent wrong -> {s['fallbacks'][0][1][:60]}...; plain graph, rel err vs fp32 {e:.4f}")
+
+
 CASES = {f.__name__[5:]: f for f in (case_numerics, case_split_and_eager, case_auto, case_fusion, case_silent_wrong,
                                       case_launch_failure, case_no_npu, case_conv_pass, case_conv,
-                                      case_conv_odd, case_conv_silent_wrong)}
+                                      case_conv_odd, case_conv_silent_wrong, case_stack, case_stack_silent_wrong)}
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

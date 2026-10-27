@@ -1,10 +1,12 @@
-"""Check the one-dispatch step against a CPU reference with the same bfp16 rounding points.
+"""Check tl.extra.npu.qwen3_stack on OmniVoice's backbone against a CPU reference with the same
+bfp16 rounding points.
 
 usage (IRON env + OmniVoice on the path):
-    python test_step.py [--nl 1] [--text short] [--ng N]
+    python test_step.py [--nl 1] [--text short]
 Prints, per intermediate of the last layer and for the logits, the relative error (norm of
 the difference over the norm of the reference) over the positions that exist (cond
-0..c_len-1, uncond 0..u_len-1). NG defaults to the fewest row groups that fit the text.
+0..c_len-1, uncond 0..u_len-1). The op's build is the one with the fewest row groups that fit
+the text; its intermediates are read back from its activation buffer.
 """
 
 import argparse
@@ -19,9 +21,9 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, "/home/chihmin/src/torch-xdna/examples")
-import omni_host as H  # noqa: E402
-import omni_step as S  # noqa: E402
+from omni_npu import stack_op  # noqa: E402
 from omni_sim import bf16, bfp16  # noqa: E402
+from triton.language.extra.npu import qwen3_stack as q3  # noqa: E402
 
 
 def capture(model, text):
@@ -64,9 +66,14 @@ def reference(model, x, NL):
     cos, sin = bfp16(torch.cat([ang.cos(), ang.sin()], 1)).chunk(2, 1)
     out = {}
     for L in range(NL):
-        wqkv, wo, wg, wu, wd, gamma = H.layer_weights(llm.layers[L])
-        wqkv, wo, wg, wu, wd = (bfp16(torch.from_numpy(w)) for w in (wqkv, wo, wg, wu, wd))
-        gq, gk = torch.from_numpy(gamma[:128]), torch.from_numpy(gamma[128:])
+        lay = llm.layers[L]
+        a, m = lay.self_attn, lay.mlp
+        g_in, g_post = lay.input_layernorm.weight.detach().float(), lay.post_attention_layernorm.weight.detach().float()
+        wqkv = bfp16(torch.cat([a.q_proj.weight, a.k_proj.weight, a.v_proj.weight]).detach().float() * g_in)
+        wo, wd = bfp16(a.o_proj.weight.detach().float()), bfp16(m.down_proj.weight.detach().float())
+        wg = bfp16(m.gate_proj.weight.detach().float() * g_post)
+        wu = bfp16(m.up_proj.weight.detach().float() * g_post)
+        gq, gk = a.q_norm.weight.detach().float(), a.k_norm.weight.detach().float()
         r = torch.rsqrt(xr.pow(2).mean(-1, keepdim=True) + eps)
         heads = bfp16(bf16((xr @ wqkv.T) * r)).view(n, 32, 128)       # the QKV GEMM's tiles
 
@@ -104,28 +111,29 @@ def seq_rows(t, NG):
     """Decoded [NG, U, 4 rb, 32, 128] -> [2 sequences, 64 NG positions, U * 128]."""
     U = t.shape[1]
     t = t.reshape(NG, U, 2, 2, 32, 128)                               # [g, u, s, r2, i, col]
-    return t.transpose(2, 0, 3, 4, 1, 5).reshape(2, NG * 64, U * 128)
+    return t.permute(2, 0, 3, 4, 1, 5).reshape(2, NG * 64, U * 128)
 
 
-def npu_intermediates(eng):
-    NG = eng.NG
-    reg = lambda name, n: np.stack([eng.region(name, n, g) for g in range(NG)])   # noqa: E731
+def npu_intermediates(prog):
+    """The last layer's intermediates a build of the op left in its activation buffer (numpy)."""
+    S, TILE, NG = q3._design(), q3.TILE, prog.NG
+    reg = lambda name, n: torch.from_numpy(np.stack([prog.region(name, n, g) for g in range(NG)]))  # noqa: E731
     out = {}
-    qr = reg("QR", 160).reshape(NG, 8, S.QR_COL, H.TILE)               # [g, c, tile]
-    q = qr[:, :, S.QR_Q:S.QR_Q + 8].reshape(NG, 16, 4, H.TILE)         # heads 2c, 2c + 1
-    out["q"] = seq_rows(H.untile(q), NG).reshape(2, -1, 16, 128)
-    kv = qr[:, :, S.QR_KV:S.QR_KV + 8].reshape(NG, 8, 2, 2, 2, H.TILE)   # [g, c, s, K/V, r2]
-    k = H.untile(kv[:, :, :, 0])                                      # [g, c, s, r2, 32, 128]
-    out["k"] = k.transpose(2, 0, 3, 4, 1, 5).reshape(2, NG * 64, 8, 128)
-    v = np.stack([H.untile_vt(t) for t in kv[:, :, :, 1].reshape(-1, H.TILE)]).reshape(NG, 8, 2, 2, 32, 128)
-    out["v"] = v.transpose(2, 0, 3, 4, 1, 5).reshape(2, NG * 64, 8, 128)
-    out["o"] = seq_rows(H.untile(reg("ATT", 64).reshape(NG, 16, 4, H.TILE)), NG)
-    out["x1"] = seq_rows(H.untile(reg("X1", 32).reshape(NG, 8, 4, H.TILE)), NG)
-    gu = H.untile(reg("GU", 192).reshape(NG, 24, 2, 4, H.TILE))     # [g, i, gate/up, rb, 32, 128]
+    qr = reg("QR", 160).reshape(NG, 8, S.QR_COL, TILE)                 # [g, c, tile]
+    q = qr[:, :, S.QR_Q:S.QR_Q + 8].reshape(NG, 16, 4, TILE)           # heads 2c, 2c + 1
+    out["q"] = seq_rows(q3.untile(q), NG).reshape(2, -1, 16, 128)
+    kv = qr[:, :, S.QR_KV:S.QR_KV + 8].reshape(NG, 8, 2, 2, 2, TILE)     # [g, c, s, K/V, r2]
+    k = q3.untile(kv[:, :, :, 0])                                     # [g, c, s, r2, 32, 128]
+    out["k"] = k.permute(2, 0, 3, 4, 1, 5).reshape(2, NG * 64, 8, 128)
+    v = torch.stack([q3.untile_vt(t) for t in kv[:, :, :, 1].reshape(-1, TILE)]).reshape(NG, 8, 2, 2, 32, 128)
+    out["v"] = v.permute(2, 0, 3, 4, 1, 5).reshape(2, NG * 64, 8, 128)
+    out["o"] = seq_rows(q3.untile(reg("ATT", 64).reshape(NG, 16, 4, TILE)), NG)
+    out["x1"] = seq_rows(q3.untile(reg("X1", 32).reshape(NG, 8, 4, TILE)), NG)
+    gu = q3.untile(reg("GU", 192).reshape(NG, 24, 2, 4, TILE))      # [g, i, gate/up, rb, 32, 128]
     out["gate"] = seq_rows(gu[:, :, 0], NG)
     out["up"] = seq_rows(gu[:, :, 1], NG)
-    out["x2"] = seq_rows(H.untile(reg("X", 32).reshape(NG, 8, 4, H.TILE)), NG)
-    return out
+    out["x2"] = seq_rows(q3.untile(reg("X", 32).reshape(NG, 8, 4, TILE)), NG)
+    return {k_: v_.numpy() for k_, v_ in out.items()}
 
 
 def rel(a, b):
@@ -137,7 +145,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nl", type=int, default=1)
     ap.add_argument("--text", default="short")
-    ap.add_argument("--ng", type=int, default=0)
     ap.add_argument("--reps", type=int, default=5)
     a = ap.parse_args()
     from omnivoice import OmniVoice
@@ -146,36 +153,27 @@ def main():
     torch.set_num_threads(16)
     model = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cpu", dtype=torch.float32)
     xc, xu = embeddings(model, capture(model, TEXTS[a.text]))
-    NG = a.ng or -(-max(len(xc), len(xu)) // 64)
-    print(f"c_len {len(xc)} u_len {len(xu)} NG {NG}", flush=True)
     t = time.time()
-    weights = None
-    if a.nl < 28:
-        wl = S.w_objects_per_layer()
-        full = np.zeros((S.NCOL, a.nl * wl + S.HEAD_W, H.TILE), np.uint8)
-        for L in range(a.nl):
-            full[:, L * wl:(L + 1) * wl] = H.column_stream(*H.layer_weights(model.llm.layers[L])[:5])
-        with torch.no_grad():
-            wh = (model.audio_heads.weight.float() * model.llm.norm.weight.float()).numpy()
-        full[:, a.nl * wl:] = H.head_stream(wh)
-        weights = full
-    eng = H.Engine(model, NL=a.nl, NG=NG, weights=weights)
-    print(f"engine ready in {time.time() - t:.1f} s", flush=True)
+    op = stack_op(model, a.nl)
+    NG = op.groups_for(len(xc), len(xu))
+    print(f"c_len {len(xc)} u_len {len(xu)} NG {NG}; op ready in {time.time() - t:.1f} s", flush=True)
+    xc_t, xu_t = torch.from_numpy(xc), torch.from_numpy(xu)
+    lc, lu = op(xc_t, xu_t)
     timing = []
-    lc, lu = eng.run(xc, xu, timing)
     for _ in range(a.reps):
-        eng.run(xc, xu, timing)
-    got = npu_intermediates(eng)
+        t = time.perf_counter()
+        op(xc_t, xu_t)
+        timing.append((time.perf_counter() - t, op.last_npu_s))
+    got = npu_intermediates(op.program(NG))
     for s_, (x, lg) in enumerate(((xc, lc), (xu, lu))):
         ref = reference(model, x, a.nl)
         n = len(x)
         errs = [f"{name} {rel(got[name][s_, :n], ref[name]):.2e}" for name in
                 ("q", "k", "v", "o", "x1", "gate", "up", "x2")]
-        errs.append(f"logits {rel(lg[:, :8200], ref['logits']):.2e}")
+        errs.append(f"logits {rel(lg.numpy(), ref['logits']):.2e}")
         print(("cond   " if s_ == 0 else "uncond ") + "  ".join(errs), flush=True)
-    tm = np.array(timing[1:])
-    print(f"step: host in {1e3 * np.median(tm[:, 0]):.2f} ms, NPU {1e3 * np.median(tm[:, 1]):.2f} ms, "
-          f"host out {1e3 * np.median(tm[:, 2]):.2f} ms", flush=True)
+    tm = np.array(timing)
+    print(f"step: {1e3 * np.median(tm[:, 0]):.2f} ms per call, NPU {1e3 * np.median(tm[:, 1]):.2f} ms", flush=True)
 
 
 if __name__ == "__main__":

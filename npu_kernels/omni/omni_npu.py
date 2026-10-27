@@ -1,43 +1,46 @@
-"""OmniVoice with its whole backbone step on the NPU: one dispatch per unmasking step.
+"""OmniVoice's backbone step on the NPU without torch.compile: one launch of Triton-XDNA's
+tl.extra.npu.qwen3_stack per unmasking step.
 
     from omni_npu import NPUBackbone
     NPUBackbone(model).install()        # model.generate(...) now runs each step on the NPU
 
-The text/audio embeddings stay on the CPU (a gather and a sum), so does the sampling between
-steps; the 28 Qwen3 layers, the final norm and the audio heads are one NPU dispatch
-(omni_step.py). The build takes the sequences in row groups of 64 positions each: a step
-uses the build with the fewest groups that holds its longer sequence (built and loaded on
-first use, then kept); a step longer than MAX_NG groups runs on the CPU as before.
+torch.compile(model.forward, backend="xdna") finds the same stack in the graph and runs the same
+op (torch_xdna/stack.py), with bit-identical logits; that is the way to use it. This route skips
+Dynamo's per-call work (~2.5-3 ms per step for OmniVoice's 317 graph inputs) and checks nothing:
+for A/B comparisons and profiling. The text/audio embeddings and the sampling stay on the CPU; a
+step longer than the op takes (384 positions per sequence) runs the original forward.
 """
 
-import os
-import sys
 import time
 
-import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import omni_host as H  # noqa: E402
+
+def stack_op(model, layers=None):
+    """tl.extra.npu.qwen3_stack over OmniVoice's backbone (its first ``layers`` layers) and audio heads."""
+    from triton.language.extra.npu import qwen3_stack
+
+    def weights(lay):
+        a, m = lay.self_attn, lay.mlp
+        return dict(q=a.q_proj.weight, k=a.k_proj.weight, v=a.v_proj.weight, o=a.o_proj.weight,
+                    gate=m.gate_proj.weight, up=m.up_proj.weight, down=m.down_proj.weight,
+                    input_norm=lay.input_layernorm.weight, post_norm=lay.post_attention_layernorm.weight,
+                    q_norm=a.q_norm.weight, k_norm=a.k_norm.weight)
+
+    llm = model.llm
+    with torch.no_grad():
+        return qwen3_stack.Qwen3Stack([weights(lay) for lay in llm.layers[:layers]], norm=llm.norm.weight,
+                                      head=model.audio_heads.weight, inv_freq=llm.rotary_emb.inv_freq)
 
 
 class NPUBackbone:
-    MAX_NG = 6            # row groups: sequences of up to 384 positions
-
-    def __init__(self, model, NL=28):
+    def __init__(self, model):
         self.model = model
-        self.NL = NL
-        self.weights = H.pack_weights(model, NL)
-        self.engines = {}
+        self.op = stack_op(model)
         self.V = model.config.audio_vocab_size
         self.C = model.config.num_audio_codebook
         self.calls = {"npu": 0, "cpu": 0}
-        self.timing = []
-
-    def engine(self, NG):
-        if NG not in self.engines:
-            self.engines[NG] = H.Engine(self.model, NL=self.NL, NG=NG, weights=self.weights)
-        return self.engines[NG]
+        self.timing = []   # per NPU step: (host seconds, NPU seconds)
 
     def forward(self, input_ids, audio_mask, attention_mask=None, **kw):
         m = self.model
@@ -46,27 +49,22 @@ class NPUBackbone:
         if ok:
             c_len = int(attention_mask[0, 0, 0].sum())
             u_len = int(attention_mask[1, 0, 0].sum())
-            NG = -(-max(c_len, u_len) // 64)
-            ok = NG <= self.MAX_NG
+            ok = max(c_len, u_len) <= self.op.max_tokens
         if not ok:
             self.calls["cpu"] += 1
             return self._orig(input_ids=input_ids, audio_mask=audio_mask, attention_mask=attention_mask, **kw)
-        eng = self.engine(NG)
         t0 = time.perf_counter()
         with torch.no_grad():
             emb = m._prepare_embed_inputs(input_ids, audio_mask).float()
-        t1 = time.perf_counter()
-        tm = []
-        lc, lu = eng.run(emb[0, :c_len], emb[1, :u_len], tm)
-        t2 = time.perf_counter()
+            lc, lu = self.op(emb[0, :c_len], emb[1, :u_len])
         n = self.C * self.V
         out = torch.zeros((2, L, n))
-        out[0, :c_len] = torch.from_numpy(lc[:, :n])
-        out[1, :u_len] = torch.from_numpy(lu[:, :n])
+        out[0, :c_len] = lc
+        out[1, :u_len] = lu
         logits = out.view(2, L, self.C, self.V).permute(0, 2, 1, 3)
         self.calls["npu"] += 1
-        # host (embeddings, tiles in, logits out), NPU dispatch
-        self.timing.append((t1 - t0 + tm[0][0] + tm[0][2] + time.perf_counter() - t2, tm[0][1]))
+        npu_s = self.op.last_npu_s
+        self.timing.append((time.perf_counter() - t0 - npu_s, npu_s))
 
         class Out:
             pass

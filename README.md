@@ -2,6 +2,7 @@
 
 A `torch.compile` backend that runs a model's GEMMs and 3x3 convolutions on the AMD XDNA NPU
 (Ryzen AI, npu2 / AIE2P) through [Triton-XDNA](https://github.com/AyaSakura-comp/Triton-XDNA),
+whole Qwen3-0.6B-sized transformer stacks (OmniVoice's backbone) as one NPU launch per call,
 and everything else on the CPU.
 
 ```python
@@ -22,6 +23,9 @@ The backend is registered through the `torch_dynamo_backends` entry point, so
 ```
 torch.compile(model, backend="xdna")
   Dynamo FX graph
+   ├─ a Qwen3Model (Qwen3-0.6B shapes) + linear head  ──►  xdna::qwen3_stack: one launch per pair of sequences
+   │    (attention under a 4-D mask given to the graph)    (and the whole graph compiled as below as well,
+   │                                                         for the calls the NPU does not take)
    ├─ F.linear(x, W, b) / x @ W  with W a parameter   ──►  xdna::linear  (custom op)
    │    linears reading the same x (q/k/v, gate/up)   ──►  xdna::linear_cat (one GEMM) + narrow
    ├─ conv2d 3x3 / stride 1 / pad 1, W a parameter    ──►  quantize ─► xdna::conv3x3 ─► dequantize
@@ -92,6 +96,33 @@ The rest of the end-to-end time is the host: quantize / dequantize (Inductor), t
 change around each launch, and ~0.1 ms per launch. Under heavier CPU load the fp32 CPU run took
 11.7 ms and the NPU run 2.0 ms.
 
+## Whole transformer stacks: one launch per step
+
+`xdna::qwen3_stack` runs Triton-XDNA's `tl.extra.npu.qwen3_stack` (branch
+`feat/npu-qwen3-stack`): every layer of a Qwen3-0.6B-sized stack (hidden 1024, 16 query / 8 kv
+heads of 128, MLP 3072, any depth), the final norm and a linear head of any width, for two
+sequences, in one launch. bfp16 operands, fp32 accumulation; the GEMMs are cascade chains with
+their norms, residuals and logits fused into the last MAC, RoPE / q-k-norm / online-softmax
+attention on all 32 cores. How it was built and measured:
+[results/omnivoice_npu.md](results/omnivoice_npu.md).
+
+The backend finds the stack in Dynamo's graph by its modules (a transformers `Qwen3Model` whose
+last hidden states feed only a linear layer), checks the shapes, RMSNorm eps 1e-6, RoPE without
+scaling and non-causal attention under one 4-D mask that is an input of the graph, and then
+compiles the graph twice: with the stack and head replaced by `xdna::qwen3_stack`, and as it
+would any other graph. The callable it returns looks at the mask on every call
+(`torch_xdna/stack.py`):
+
+| the call | runs |
+|---|---|
+| every sequence's mask a prefix block of 1-384 positions (its first n positions see exactly those n), later positions padding that sees itself or nothing -- OmniVoice's cond / uncond batch | the fused graph: one NPU launch per pair of sequences; padding rows come back as zeros |
+| any other mask (causal, left padding, a 2-D padding mask expanded), longer sequences, no NPU | the plain graph |
+| the first fused call of each build (row-group count) | also the original graph eagerly in fp32: the stack's output must be within 10% (OmniVoice: 1.3-2.3%), else `NPUResultMismatch` and the plain graph from then on |
+
+Both `policy="auto"` and `"npu"` take the stack without timing it against the CPU (measured
+1.6-1.7x faster end to end at 58, 113 and 264 positions, below); `policy="cpu"` or
+`stacks=False` leave it alone.
+
 ## Results: whole CNNs
 
 `examples/vgg16_xdna.py`: torchvision VGG-16 (ImageNet weights), `policy="npu"`, `min_rows=1`,
@@ -157,6 +188,7 @@ another process was building.)
 | no NPU (no `/dev/accel/accel0`, no Triton-XDNA, `TORCH_XDNA_DISABLE_NPU=1`) | CPU, same math |
 | an NPU compile / context / launch error | that shape moves to the CPU and the call still returns; after 3 failing shapes the NPU is retired for the process |
 | `fallback="eager"` | the rest of the graph runs uncompiled instead of through Inductor |
+| a Qwen3-0.6B-sized stack + head | one NPU launch per pair of sequences when the mask allows it, else the graph compiled as usual (see "Whole transformer stacks") |
 
 Other accelerators: Triton-XDNA's `triton` package replaces the one ROCm/CUDA
 PyTorch depends on, so a GPU cannot be driven from the same process; the
@@ -174,6 +206,7 @@ non-GEMM part of the graph targets the CPU.
 | `verify` | `"first"` | compare NPU programs with the CPU: `first` launch / `always` / `off` |
 | `cpu_kernel` | `"int8"` | CPU-routed GEMMs: `int8` (same as NPU) / `fp` |
 | `fuse` | `True` | fuse linears sharing an input into one GEMM |
+| `stacks` | `True` | run a Qwen3-0.6B-sized stack + head as one NPU launch per call (not with `policy="cpu"`) |
 | `tuned_tilings` | `True` | per-shape tiling from the sweep table (`tools/sweep.py`) |
 | `row_buckets` | `(128, 256, 512, 1024)` | padded row counts, each one NPU program per (N, K) |
 | `min_rows` / `min_macs` | `16` / `2e6` | smaller GEMMs stay on the CPU |
@@ -200,17 +233,34 @@ source ~/src/Triton-XDNA/npu-env.sh          # XRT + mlir-aie/air paths
 `examples/omnivoice_xdna.py`: OmniVoice (k2-fsa; Qwen3-0.6B backbone, a
 diffusion LM run once per unmasking step) with `model.forward` compiled by
 this backend, no OmniVoice changes. 8 steps, 16 threads, Ryzen AI MAX+ 395,
-median of 3, `generate()` wall time for a 7 / 19 / 42-character sentence:
+`generate()` wall time for a 7 / 19 / 42-character sentence (58 / 113 / 264
+positions), median of 10 rounds with the three routes interleaved:
+
+| | 7 chars | 19 chars | 42 chars | |
+|---|---|---|---|---|
+| `xdna` (defaults: the stack) | **0.163 s** | **0.282 s** | **0.639 s** | every step one NPU launch (1.65 / 1.58 / 1.74x the CPU route) |
+| `xdna`, `policy="cpu"` | 0.269 s | 0.445 s | 1.113 s | W8A8 GEMMs on the CPU, Inductor |
+| the same NPU op without torch.compile (`npu_kernels/omni/omni_npu.py`) | 0.154 s | 0.271 s | 0.619 s | |
+| eager fp32 (another day) | 1.30 s | 2.00 s | 3.71 s | |
+
+The fused route's logits are bit-identical to the direct op's; the 3-6% between them is
+Dynamo's per-call work on a 317-input graph (2.5-3.3 ms per step; the fused graph itself is
+1-2 ms faster than the direct route, its embeddings fused by Inductor). Speech quality is that
+of the op: Whisper CER on par with the CPU int8 route over 10 seeds
+([results/omnivoice_npu.md](results/omnivoice_npu.md)).
+
+Before the stack, with one NPU launch per GEMM (5 fused shapes, 904 launches per sentence):
 
 | | 7 chars | 19 chars | 42 chars | GEMMs on |
 |---|---|---|---|---|
 | eager fp32 (no compile) | 1.39–1.48 s | 2.01–2.54 s | 4.01–4.91 s | — |
-| `xdna`, `policy="npu"` | 0.92 s | 1.16 s | 2.60 s | NPU (904 launches / sentence) |
-| `xdna`, `policy="npu"`, `fallback="eager"` | 1.01 s | 1.43 s | 2.89 s | NPU |
-| `xdna`, `policy="auto"` | **0.40 s** | **0.66 s** | **1.70 s** | CPU (chosen for every shape) |
+| `xdna`, `policy="npu"`, `stacks=False` | 0.92 s | 1.16 s | 2.60 s | NPU (904 launches / sentence) |
+| `xdna`, `policy="npu"`, `stacks=False`, `fallback="eager"` | 1.01 s | 1.43 s | 2.89 s | NPU |
+| `xdna`, `policy="auto"`, `stacks=False` | 0.40 s | 0.66 s | 1.70 s | CPU (chosen for every shape) |
 | `xdna`, `policy="cpu"` | 0.45 s | 0.71 s | 1.79 s | CPU |
 
-(the eager fp32 ranges span a quiet run and one with another job on the box.)
+(an earlier day, before the int8 quantize / dequantize became graph ops; the eager fp32 ranges
+span a quiet run and one with another job on the box.)
 
 Every GEMM of the model can run on the NPU (5 fused shapes: q/k/v, o,
 gate/up, down, audio heads), but per GEMM the NPU is 3–5× slower than the

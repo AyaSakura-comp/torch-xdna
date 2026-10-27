@@ -39,6 +39,12 @@ class Config:
     min_macs: int = 2_000_000
     # Linears that read the same input (q/k/v, gate/up) run as one GEMM.
     fuse: bool = True
+    # A whole transformer stack the NPU has a one-launch program for -- a transformers Qwen3Model
+    # of Qwen3-0.6B's shapes feeding a linear head, attention under a 4-D mask given to the graph
+    # (OmniVoice's backbone) -- runs as that launch (Triton-XDNA's tl.extra.npu.qwen3_stack, bfp16)
+    # whenever the mask is a prefix block per sequence of at most 384 positions; other calls run
+    # the graph compiled as usual (stack.py). Policies "auto" and "npu" alike.
+    stacks: bool = True
     # Pick each NPU launch's tiling from the swept table (tools/sweep.py) instead of the per-row default.
     tuned_tilings: bool = True
     # Check NPU results against the CPU: "first" launch of every NPU program (catches a silently

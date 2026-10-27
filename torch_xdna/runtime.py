@@ -31,11 +31,14 @@ class Stats:
         self.macs = defaultdict(int)        # device -> multiply-accumulates (unpadded)
         self.launches = 0                   # NPU launches (a call may split into several)
         self.fallbacks = []                 # (shape, error) when the NPU failed
+        self.stacks = defaultdict(int)      # (stack, "npu" fused / "cpu" plain graph) -> graph calls
+        self.checks = []                    # (stack, rel err) of the first fused calls vs the model
 
     def as_dict(self):
         return dict(calls=dict(self.calls), seconds={k: round(v, 4) for k, v in self.seconds.items()},
                     gmacs={k: round(v / 1e9, 3) for k, v in self.macs.items()},
                     npu_launches=self.launches, fallbacks=list(self.fallbacks),
+                    stacks={f"{k[0]} on {k[1]}": v for k, v in self.stacks.items()}, checks=list(self.checks),
                     decisions={"x".join(map(str, k)): v for k, v in decisions.items()},
                     npu_available=kernels.available(), npu_unavailable_reason=kernels.unavailable_reason())
 

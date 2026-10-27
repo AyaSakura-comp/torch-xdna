@@ -1,4 +1,5 @@
-"""xdna::linear / linear_cat / conv3x3, the custom ops the backend puts in place of offloadable GEMMs and convs.
+"""xdna::linear / linear_cat / conv3x3 / qwen3_stack, the custom ops the backend puts in place of
+offloadable GEMMs, convs and whole transformer stacks.
 
 To the rest of torch.compile it is an opaque op with a shape function, so
 Inductor compiles everything around it and calls it as an extern kernel.
@@ -8,7 +9,7 @@ from typing import Optional
 
 import torch
 
-from . import conv, runtime
+from . import conv, runtime, stack
 
 _configs = []  # cfg_id -> Config; the op's arguments must be plain values
 
@@ -73,3 +74,16 @@ def _(xq, weight, relu, cfg_id):
     q = xq.new_empty((xq.shape[0], weight.shape[0], xq.shape[2], xq.shape[3]),
                      dtype=torch.uint8 if relu else torch.int8)
     return q, weight.new_empty((weight.shape[0],), dtype=torch.float32)
+
+
+@torch.library.custom_op("xdna::qwen3_stack", mutates_args=())
+def qwen3_stack(x: torch.Tensor, mask: torch.Tensor, stack_id: int, cfg_id: int) -> torch.Tensor:
+    """A whole Qwen3-0.6B-sized stack with its final norm and linear head (stack.py): hidden states
+    x [B, L, 1024] under an attention mask [B, H, L, L] that is a prefix block per sequence -> the
+    head's output [B, L, N], zero past each sequence's length."""
+    return stack.run(_configs[cfg_id], stack_id, x, mask)
+
+
+@qwen3_stack.register_fake
+def _(x, mask, stack_id, cfg_id):
+    return x.new_empty(*x.shape[:-1], stack.out_features(stack_id))

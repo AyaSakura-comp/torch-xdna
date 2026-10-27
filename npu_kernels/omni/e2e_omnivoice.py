@@ -1,11 +1,13 @@
-"""OmniVoice end to end with the backbone on the NPU (one dispatch per step) vs the CPU.
+"""OmniVoice end to end with the backbone on the NPU (one launch per step) vs the CPU.
 
-Per mode: generate() wall time (median of reps after a warm-up), the time inside the NPU
-dispatches, the first step's logits vs the fp32 model, and Whisper's transcript / CER of the
-audio over a few seeds.
+Modes: xdna = torch.compile(model.forward, backend="xdna") with its defaults (the backbone and
+audio heads become one tl.extra.npu.qwen3_stack launch per step), npu = the same op without
+torch.compile (omni_npu.NPUBackbone), cpu-int8 = the backend with policy "cpu", fp32 = the model
+as it is. Per mode: generate() wall time (median of reps after a warm-up), per-step times, and
+with --asr Whisper's transcript / CER of the audio over a few seeds.
 
 usage (IRON env + OmniVoice on the path):
-    python e2e_omnivoice.py [--texts short] [--seeds 0 1 2] [--reps 5] [--modes npu cpu-int8 fp32]
+    python e2e_omnivoice.py [--texts short] [--seeds 0 1 2] [--reps 5] [--modes xdna cpu-int8 fp32]
 """
 
 import argparse
@@ -45,7 +47,7 @@ def main():
     ap.add_argument("--texts", nargs="+", default=["short"])
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     ap.add_argument("--reps", type=int, default=5)
-    ap.add_argument("--modes", nargs="+", default=["npu", "cpu-int8", "fp32"])
+    ap.add_argument("--modes", nargs="+", default=["xdna", "cpu-int8", "fp32"])
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--wav-dir", default=None)
     ap.add_argument("--asr", action="store_true")
@@ -72,10 +74,10 @@ def main():
             from omni_npu import NPUBackbone
 
             npu = NPUBackbone(model).install()
-        elif mode == "cpu-int8":
-            import torch_xdna  # noqa: F401
+        elif mode in ("xdna", "cpu-int8"):
+            import torch_xdna
 
-            model.forward = torch.compile(orig, backend="xdna", options={"policy": "cpu"})
+            model.forward = torch.compile(orig, backend="xdna", options={"policy": "cpu"} if mode == "cpu-int8" else None)
         rows = []
         for name in a.texts:
             text = TEXTS[name]
@@ -83,6 +85,8 @@ def main():
             model.generate(text=text, num_step=a.steps)          # warm-up (compiles / loads)
             if npu is not None:
                 npu.calls = {"npu": 0, "cpu": 0}
+            if mode == "xdna":
+                torch_xdna.stats.reset()
             ts = []
             for _ in range(a.reps):
                 if npu is not None:
@@ -97,6 +101,10 @@ def main():
                 row.update(npu_ms_per_step=round(1e3 * float(np.median(tm[:, 1])), 2),
                            host_ms_per_step=round(1e3 * float(np.median(tm[:, 0])), 2),
                            calls=dict(npu.calls))
+            elif mode == "xdna":
+                st = torch_xdna.stats.as_dict()
+                row.update(op_ms_per_step=round(1e3 * st["seconds"].get("npu", 0) / max(1, st["calls"].get("npu", 0)), 2),
+                           stack_calls=st["stacks"], checks=st["checks"])
             cers = []
             for seed in a.seeds if asr is not None else []:
                 torch.manual_seed(seed)

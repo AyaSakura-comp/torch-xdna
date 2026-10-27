@@ -21,10 +21,42 @@ int8 within 1.4-1.5% / 0.8%; the NPU's softmax distributions are the closer ones
 variation 0.14-0.19 vs 0.21-0.25). The earlier per-GEMM NPU path (113 dispatches per step) was
 2-3x *slower* than CPU int8 (`npu_investigation.md`).
 
-Code: `npu_kernels/omni/` — `omni_step.py` (IRON design + runtime sequence), `omni_core.cc`
-(per-core kernels, Peano), `omni_host.py` (weight packing, builds, `Engine`), `omni_npu.py`
-(`NPUBackbone(model).install()`), `test_step.py` (every intermediate vs a CPU reference with the
-same rounding points), `e2e_omnivoice.py` (the table above).
+Code: the step is Triton-XDNA's op `tl.extra.npu.qwen3_stack` (branch `feat/npu-qwen3-stack`):
+`amd_triton_npu/language/npu/qwen3_stack.py` (weight packing, builds, runs),
+`kernels/qwen3_stack_design.py` (IRON design + runtime sequence), `kernels/qwen3_stack_core.cc`
+(per-core kernels, Peano), `examples/qwen3_stack/` (every build checked on random weights).
+torch-xdna runs it from `torch.compile(model.forward, backend="xdna")` (`torch_xdna/stack.py`,
+next section). `npu_kernels/omni/` keeps the tools: `omni_npu.py` (the op without
+torch.compile: the "NPU" column above), `test_step.py` (every intermediate vs a CPU reference
+with the same rounding points), `e2e_omnivoice.py` (the table above).
+
+## Through torch.compile
+
+`torch.compile(model.forward, backend="xdna")` with its defaults runs every step as this one
+launch: the backend finds OmniVoice's `Qwen3Model` (2264 graph nodes) and audio heads in
+Dynamo's graph, replaces them with `xdna::qwen3_stack`, also compiles the graph the usual way,
+and picks per call from the attention mask (README, "Whole transformer stacks").
+
+* **Logits**: bit-identical to the op without torch.compile, and to the engine before the op
+  moved into Triton-XDNA, for all three texts; the audio and CER above are unchanged. The
+  first-call checks against the fp32 model: 1.29% (1 row group), 1.49% (2), 2.27% (5).
+* **Time**, `generate()` 8 steps, median of 10 interleaved rounds:
+
+  | text | `xdna` | `xdna`, `policy="cpu"` | the op without torch.compile |
+  |---|---|---|---|
+  | short | **0.163 s** | 0.269 s (1.65x) | 0.154 s |
+  | mid | **0.282 s** | 0.445 s (1.58x) | 0.271 s |
+  | long | **0.639 s** | 1.113 s (1.74x) | 0.619 s |
+
+  Per step the fused graph alone is 1-2 ms faster than the direct route (Inductor fuses the
+  embeddings); Dynamo's per-call work on a 317-input graph adds 2.5-3.3 ms (guard filters
+  change nothing), which is the 3-6% between the two.
+* **Other weights**: on random weights (flat attention, no outliers) the op is ~5% from fp32
+  at two layers (`examples/qwen3_stack`). Fed its own inputs, each GEMM stage is ~1.5% from a
+  CPU model that rounds bfp16 to nearest, and attention adds 2-3% on flat attention (its
+  probabilities are bfp16 too); OmniVoice's trained weights land at 1.3-2.3%. Whether the
+  cores' float-to-bfp16 conversion rounds otherwise (a rounding-mode register) is not checked
+  yet.
 
 ## Mapping
 
@@ -102,10 +134,11 @@ source ~/src/Triton-XDNA/npu-env.sh
 export PEANO_INSTALL_DIR=~/src/Triton-XDNA/sandbox/lib/python3.13/site-packages/llvm-aie
 cd npu_kernels/omni
 ~/src/omnivoice-npu/venv/bin/python test_step.py --nl 2 --text long      # intermediates vs reference
-~/src/omnivoice-npu/venv/bin/python e2e_omnivoice.py --texts short mid long --modes npu cpu-int8 --asr
+~/src/omnivoice-npu/venv/bin/python e2e_omnivoice.py --texts short mid long --modes xdna cpu-int8 --asr
 ```
 
-In code: `from omni_npu import NPUBackbone; NPUBackbone(model).install()`; `model.generate(...)`
-then runs every step on the NPU (a step longer than 6 groups falls back to the CPU). The first
-use packs the weights (~1 min, cached in `~/.cache/omni_npu/`) and builds the NG in question
-(seconds, cached in `npu_kernels/omni/build/`).
+In code: `model.forward = torch.compile(model.forward, backend="xdna")`; `model.generate(...)`
+then runs every step on the NPU (a step whose mask the op does not take, e.g. longer than 384
+positions, runs the plain graph). The first use packs the weights (~3 s, cached by content in
+`~/.cache/amd_triton_npu/qwen3_stack/`) and builds the row-group count in question (seconds,
+cached there too).

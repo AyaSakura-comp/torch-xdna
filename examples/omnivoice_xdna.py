@@ -1,12 +1,14 @@
-"""OmniVoice TTS with torch.compile(backend="xdna"): its GEMMs on the NPU, the rest on the CPU.
+"""OmniVoice TTS with torch.compile(backend="xdna"): the backbone on the NPU, the rest on the CPU.
 
 No OmniVoice code changes: the model's forward (embeddings, the 28-layer
 Qwen3 backbone, the audio heads) is compiled with the xdna backend, and
-generate() calls it once per unmasking step as usual.
+generate() calls it once per unmasking step as usual. The backend runs the
+backbone and the audio heads as one NPU launch per step (xdna::qwen3_stack);
+with --no-stacks it offloads them GEMM by GEMM instead.
 
 usage (bash):
   source ~/src/Triton-XDNA/npu-env.sh
-  python examples/omnivoice_xdna.py --policy npu|auto|cpu [--fallback inductor|eager] [--steps 8] [--wav-dir out]
+  python examples/omnivoice_xdna.py --policy npu|auto|cpu [--fallback inductor|eager] [--no-stacks] [--steps 8] [--wav-dir out]
   python examples/omnivoice_xdna.py --eager          # the uncompiled fp32 baseline
 """
 
@@ -33,6 +35,7 @@ def main():
     ap.add_argument("--fallback", default="inductor", choices=["inductor", "eager"])
     ap.add_argument("--eager", action="store_true", help="no torch.compile at all (fp32 baseline)")
     ap.add_argument("--no-tuned", action="store_true", help="default tiling per row bucket, not the swept table")
+    ap.add_argument("--no-stacks", action="store_true", help="GEMM by GEMM, not the backbone as one launch")
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--threads", type=int, default=16)
@@ -46,11 +49,12 @@ def main():
     model = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cpu", dtype=torch.float32)
     if hasattr(model.llm, "_orig_mod"):  # the repo compiles the backbone for the GPU when triton imports
         model.llm = model.llm._orig_mod
-    tag = "eager-fp32" if args.eager else f"xdna-{args.policy}-{args.fallback}" + ("-untuned" if args.no_tuned else "")
+    tag = "eager-fp32" if args.eager else f"xdna-{args.policy}-{args.fallback}" + \
+        ("-untuned" if args.no_tuned else "") + ("-nostacks" if args.no_stacks else "")
     if not args.eager:
         model.forward = torch.compile(model.forward, backend="xdna",
                                       options={"policy": args.policy, "fallback": args.fallback,
-                                               "tuned_tilings": not args.no_tuned})
+                                               "tuned_tilings": not args.no_tuned, "stacks": not args.no_stacks})
 
     t = time.perf_counter()
     for text in TEXTS.values():  # compile: static shape first, then the dynamic-shape graph
@@ -76,7 +80,7 @@ def main():
         row = dict(mode=tag, text=name, steps=args.steps, median_s=round(statistics.median(times), 3),
                    audio_s=round(dur, 2), rtf=round(statistics.median(times) / dur, 3),
                    all_s=[round(x, 3) for x in times],
-                   gemm_calls_per_rep={k: v // args.reps for k, v in s["calls"].items()},
+                   op_calls_per_rep={k: v // args.reps for k, v in s["calls"].items()},
                    npu_launches_per_rep=s["npu_launches"] // args.reps)
         rows.append(row)
         print(json.dumps(row, ensure_ascii=False), flush=True)

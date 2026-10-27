@@ -6,7 +6,10 @@ a 3x3 / stride-1 / padding-1 conv2d with a parameter weight becomes quantize ->
 xdna::conv3x3 -> dequantize (conv.py); the rest of the graph is left to Inductor
 (or run eagerly). What runs where is decided per call at run time (see
 runtime.py, conv.py), so a missing or failing NPU only moves GEMMs and convs
-back to the CPU.
+back to the CPU. A whole transformer stack the NPU runs in one launch (a
+Qwen3Model of Qwen3-0.6B's shapes into a linear head) is first taken out as
+xdna::qwen3_stack, with the graph also compiled as above for the calls the NPU
+cannot take (stack.py).
 
 GEMMs between two activations (attention scores) are not offloaded: their
 operands change every call, and at these sizes a launch (~0.3 ms) costs more
@@ -228,9 +231,7 @@ def _out_features(w):
     return int(t.shape[0]) if isinstance(t, torch.Tensor) else None
 
 
-def xdna_backend(gm: torch.fx.GraphModule, example_inputs, options=None, mode=None):
-    """The torch.compile backend; `options` are torch_xdna.Config fields."""
-    cfg = _config.config.merged(options)
+def _compile(gm, example_inputs, cfg):
     n = offload_gemms(gm, example_inputs, cfg)
     if cfg.verbose:
         log.warning("torch_xdna: %d GEMMs / convs offloadable in a graph of %d nodes (policy=%s, fallback=%s)",
@@ -240,3 +241,16 @@ def xdna_backend(gm: torch.fx.GraphModule, example_inputs, options=None, mode=No
     from torch._inductor.compile_fx import compile_fx
 
     return compile_fx(gm, example_inputs)
+
+
+def xdna_backend(gm: torch.fx.GraphModule, example_inputs, options=None, mode=None):
+    """The torch.compile backend; `options` are torch_xdna.Config fields."""
+    cfg = _config.config.merged(options)
+    if cfg.stacks and cfg.policy != "cpu" and kernels.available():
+        from . import stack
+
+        plan = stack.find(gm, example_inputs)
+        if plan is not None:
+            # the graph twice: the stack as one NPU launch, and as usual; a dispatcher picks per call
+            return stack.compile_fused(gm, example_inputs, cfg, ops.config_id(cfg), plan, _compile)
+    return _compile(gm, example_inputs, cfg)
