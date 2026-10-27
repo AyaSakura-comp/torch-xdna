@@ -22,9 +22,11 @@ import time
 
 import torch
 
-IMAGES = sorted(glob.glob(os.path.expanduser("~/Pictures/Gemini_Generated_Image_*.png")))[:4] + \
-    [os.path.expanduser(p) for p in ("~/scifi_ref.jpg", "~/sakura_sidebyside.jpg", "~/abl_grid.jpg",
-                                     "~/filmtest2_compare.jpg")]
+_SK = os.path.expanduser("~/.local/lib/python3.13/site-packages/skimage/data")
+_MPL = os.path.expanduser("~/.local/lib/python3.13/site-packages/matplotlib/mpl-data/sample_data")
+IMAGES = [os.path.join(_SK, f) for f in ("astronaut.png", "chelsea.png", "coffee.png", "rocket.jpg",
+                                         "motorcycle_left.png", "brick.png", "coins.png")] + \
+    [os.path.join(_MPL, "grace_hopper.jpg")]
 WAVS = sorted(glob.glob(os.path.expanduser("~/src/torch-xdna/results/wav_q/eager-fp32_s8_*.wav")))
 PRECISION = os.environ.get("ZOO_PRECISION", "int8")
 NPU_OPTS = dict(policy="npu", min_rows=1, min_macs=0, precision=PRECISION)

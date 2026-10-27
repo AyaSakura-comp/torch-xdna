@@ -275,13 +275,16 @@ sampling noise of 8-step generation.
 
 `model.forward = torch.compile(model.forward, backend="xdna", options=dict(policy="npu",
 min_rows=1, min_macs=0, precision=...))` with no model changes; reference = the same model
-in fp32 eager. Run sequentially on a clean cache: every NPU program passed its first-launch
-check (0 fallbacks), and in int8 every model's output is bit-identical to the CPU int8 run.
+in fp32 eager. Every NPU program passed its first-launch check (0 fallbacks), and in int8
+every model's output is bit-identical to the CPU int8 run except ResNet-50's: its 3x3 convs
+run as int8 convs on the NPU (`xdna::conv3x3`, in both precisions) and stay fp32 under policy
+"cpu". The ResNet-50 and DINOv3 rows were re-run on 2026-10-27 on public sample images
+(scikit-image, matplotlib); the others are from 2026-10-26, run sequentially on a clean cache.
 
 | model | NPU share of FLOPs | int8 vs fp32 | bf16 vs fp32 |
 |---|---|---|---|
-| ResNet-50 (torchvision) | 0.05% (fc only; convs stay on CPU) | top-1 8/8, cos 0.99996 | top-1 8/8, cos 0.99999 |
-| DINOv3 ViT-L/16 | 99.8% | embedding cos 0.997 | cos 0.9997 |
+| ResNet-50 (torchvision) | 36.8% (13 3x3 stride-1 convs + fc; other convs on CPU) | top-1 8/8, cos 0.9994 | top-1 8/8, cos 0.9995 |
+| DINOv3 ViT-L/16 | 99.8% | embedding cos 0.997 | cos 0.9998 |
 | GPT-2 (HF, Conv1D) | 100% | **ppl 23.4 -> 67.6, text degenerates** | ppl 22.1, top-1 93%, fluent |
 | Qwen2.5-0.5B-Instruct | 100% | ppl 10.09 -> 11.73, fluent, diverges | ppl 9.95, top-1 98%, diverges later |
 | multilingual-e5-small | 100% | ranking identical, cos 0.999 | ranking identical, cos 0.9999 |
