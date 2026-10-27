@@ -224,10 +224,10 @@ static inline const uint8_t *tile_blk(const uint8_t *t, int rb, int kb) {
   return t + (((rb >> 1) * 16 + kb) * 2 + (rb & 1)) * BLK;
 }
 
-NOINLINE static void copy_tile(const uint8_t *s, uint8_t *d) {
-  const v64int8 *a = (const v64int8 *)s;
-  v64int8 *b = (v64int8 *)d;
-  NOUNROLL for (int i = 0; i < TILE / 64; i++) b[i] = a[i];
+NOINLINE static void copy_tile(const uint8_t *__restrict s, uint8_t *__restrict d) {
+  const v64int8 *__restrict a = (const v64int8 *)s;
+  v64int8 *__restrict b = (v64int8 *)d;
+  UNROLL8 for (int i = 0; i < TILE / 64; i++) b[i] = a[i];
 }
 
 extern "C" {
@@ -306,9 +306,9 @@ void SYM(og_load)(const uint8_t *tile, uint8_t *st, int32_t ch, int32_t part, in
   }
   if (parts == 1) {
     NOUNROLL for (int p = 0; p < 2; p++) {
-      const v64int8 *s = (const v64int8 *)(tile + p * TILE_PAIR);
-      v64int8 *d = (v64int8 *)(st + OFF_ABUF + p * ABUF_PAIR + ch * TILE_PAIR);
-      NOUNROLL for (int i = 0; i < TILE_PAIR / 64; i++) d[i] = s[i];
+      const v64int8 *__restrict s = (const v64int8 *)(tile + p * TILE_PAIR);
+      v64int8 *__restrict d = (v64int8 *)(st + OFF_ABUF + p * ABUF_PAIR + ch * TILE_PAIR);
+      UNROLL8 for (int i = 0; i < TILE_PAIR / 64; i++) d[i] = s[i];
     }
     return;
   }
@@ -401,8 +401,6 @@ static inline VB64 rstd_bf(const uint8_t *st, int gi, int rb) {
   return aie::load_v<64>((const bfloat16 *)(st + OFF_RSTD) + (gi * 4 + rb) * 64);
 }
 
-static inline VB64 scaled(ACC a, VB64 r) { return aie::mul(a.template to_vector<bfloat16>(), r).template to_vector<bfloat16>(); }
-
 // The epilogue of a quarter of group g's sums (row blocks 2p, 2p + 1 x column
 // blocks 2q, 2q + 1 of the group), as the last chunk's mac leaves them in
 // registers; o is the output tile (the unit's object, or for the second row
@@ -421,13 +419,14 @@ static inline void epi_pq(uint8_t *st, uint8_t *o, int e, int gi, int g, int p, 
     return;
   }
   const VB64 r0 = rstd_bf(st, gi, rb), r1 = rstd_bf(st, gi, rb + 1);
-  const VB64 y00 = scaled(a00, r0), y01 = scaled(a01, r0), y10 = scaled(a10, r1), y11 = scaled(a11, r1);
+  const ACC y00 = aie::mul(a00.template to_vector<bfloat16>(), r0), y01 = aie::mul(a01.template to_vector<bfloat16>(), r0);
+  const ACC y10 = aie::mul(a10.template to_vector<bfloat16>(), r1), y11 = aie::mul(a11.template to_vector<bfloat16>(), r1);
   if (e == EPI_LOGITS) {
     bfloat16 *d = (bfloat16 *)o + (g & 1) * 1024 + (rb * 4 + nb) * 64;
-    aie::store_v(d, y00);
-    aie::store_v(d + 64, y01);
-    aie::store_v(d + 256, y10);
-    aie::store_v(d + 320, y11);
+    aie::store_v(d, y00.template to_vector<bfloat16>());
+    aie::store_v(d + 64, y01.template to_vector<bfloat16>());
+    aie::store_v(d + 256, y10.template to_vector<bfloat16>());
+    aie::store_v(d + 320, y11.template to_vector<bfloat16>());
     return;
   }
   BO out((bfp16ebs8 *)(o + (p * 16 + cb) * 2 * BLK));
