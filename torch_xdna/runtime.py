@@ -352,6 +352,50 @@ def linear(cfg, x, weight, bias, transposed):
     return y.reshape(*shape, N)
 
 
+def linear_int8(x, weights, biases, transposed: bool, cfg_id: int):
+    """torch.cat([F.linear(x, w, b) for w, b in zip(weights, biases)], -1) through W8A8: what the
+    backend puts in the graph (precision "int8").
+
+    Only the integer GEMM is a custom op (xdna::linear_i8). The per-row quantization before it and
+    the dequantization after it are ordinary torch ops, so Inductor fuses them with the norm, the
+    residual add or the activation next to them instead of running them one by one around the op.
+    """
+    x2 = x.reshape(-1, x.shape[-1])
+    sx = x2.abs().amax(dim=1, keepdim=True).float().clamp(min=1e-8) / 127
+    xq = torch.round(x2.float() / sx).clamp(-127, 127).to(torch.int8)
+    acc, sw = torch.ops.xdna.linear_i8(xq, weights, transposed, cfg_id)
+    y = acc.float() * sx * sw
+    if any(b is not None for b in biases):
+        sizes = [w.shape[1] if transposed else w.shape[0] for w in weights]
+        y = y + torch.cat([b.float() if b is not None else y.new_zeros(n) for b, n in zip(biases, sizes)])
+    return y.to(x.dtype).reshape(*x.shape[:-1], y.shape[-1])
+
+
+def linear_i8(cfg, xq, weights, transposed):
+    """(int32 acc [R, N], weight scales [N]) of xdna::linear_i8, on the NPU or the CPU."""
+    global VERIFY
+    VERIFY = cfg.verify
+    t0 = time.perf_counter()
+    qw = qweight(weights[0] if len(weights) == 1 else list(weights), transposed)
+    if xq.shape[0] == 0:
+        return xq.new_zeros((0, qw.N), dtype=torch.int32), qw.sw.clone()
+    with _lock:
+        device = _choose(cfg, xq.shape[0], qw, lambda: _npu_acc(xq, qw, cfg.row_buckets, cfg.tuned_tilings),
+                         lambda: _cpu_acc(xq, qw))
+        acc = None
+        if device == "npu":
+            try:
+                acc = _npu_acc(xq, qw, cfg.row_buckets, cfg.tuned_tilings)
+            except Exception as e:  # compile / context / launch failure: this shape moves to the CPU
+                _npu_failed(cfg, xq.shape[0], qw, e)
+                device = "cpu"
+        if acc is None:
+            acc = _cpu_acc(xq, qw)
+    _account(device, t0, xq.shape[0], qw)
+    # a fresh tensor: Inductor may reuse an extern op's output buffer once it is dead
+    return acc, qw.sw.clone()
+
+
 def linear_cat(cfg, x, weights, biases):
     """torch.cat([F.linear(x, w, b) for w, b in zip(weights, biases)], -1) as one W8A8 GEMM."""
     global VERIFY

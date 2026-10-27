@@ -104,6 +104,8 @@ def offload_gemms(gm: torch.fx.GraphModule, example_inputs, cfg) -> int:
         count += 1
     if cfg.fuse:
         _fuse_shared_input(gm, cid)
+    if cfg.precision == "int8" and cfg.cpu_kernel == "int8":
+        _quantize_in_graph(gm, cid)
     count += _offload_convs(gm, static, cid, attr, cfg)
     gm.graph.lint()
     gm.recompile()
@@ -196,6 +198,29 @@ def _fuse_shared_input(gm, cid):
                 start += n
         for m in members:
             gm.graph.erase_node(m)
+
+
+def _quantize_in_graph(gm, cid):
+    """xdna::linear / linear_cat -> linear_int8: quantize, xdna::linear_i8, dequantize as graph ops,
+    which Inductor fuses with the ops around them (runtime.linear_int8)."""
+    from .runtime import linear_int8
+
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function":
+            continue
+        if node.target is torch.ops.xdna.linear.default:
+            x, w, b, transposed, _ = node.args
+            weights, biases = [w], [b]
+        elif node.target is torch.ops.xdna.linear_cat.default:
+            x, weights, biases, _ = node.args
+            transposed = False
+        else:
+            continue
+        with gm.graph.inserting_after(node):
+            new = gm.graph.call_function(linear_int8, (x, list(weights), list(biases), transposed, cid))
+        new.meta.update(node.meta)
+        node.replace_all_uses_with(new)
+        gm.graph.erase_node(node)
 
 
 def _out_features(w):

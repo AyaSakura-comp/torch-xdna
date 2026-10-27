@@ -45,6 +45,21 @@ def _(x, weights, biases, cfg_id):
     return x.new_empty(*x.shape[:-1], sum(w.shape[0] for w in weights))
 
 
+@torch.library.custom_op("xdna::linear_i8", mutates_args=())
+def linear_i8(xq: torch.Tensor, weights: list[torch.Tensor], transposed: bool,
+              cfg_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The integer part of W8A8 linears that read the same input: int8 xq [R, K] ->
+    (acc [R, N] int32, sw [N] float32), with x @ W^T ~= acc * sx[:, None] * sw for the row scales sx
+    that gave xq. Several weights are one GEMM, their outputs concatenated."""
+    return runtime.linear_i8(_configs[cfg_id], xq, weights, transposed)
+
+
+@linear_i8.register_fake
+def _(xq, weights, transposed, cfg_id):
+    N = sum(w.shape[1] if transposed else w.shape[0] for w in weights)
+    return xq.new_empty((xq.shape[0], N), dtype=torch.int32), xq.new_empty((N,), dtype=torch.float32)
+
+
 @torch.library.custom_op("xdna::conv3x3", mutates_args=())
 def conv3x3(xq: torch.Tensor, weight: torch.Tensor, relu: bool, cfg_id: int) -> tuple[torch.Tensor, torch.Tensor]:
     """The integer part of a 3x3 / stride-1 / padding-1 conv of a [Co, Ci, 3, 3] parameter weight:
