@@ -21,7 +21,7 @@ int8 within 1.4-1.5% / 0.8%; the NPU's softmax distributions are the closer ones
 variation 0.14-0.19 vs 0.21-0.25). The earlier per-GEMM NPU path (113 dispatches per step) was
 2-3x *slower* than CPU int8 (`npu_investigation.md`).
 
-Code: the step is Triton-XDNA's op `tl.extra.npu.qwen3_stack` (branch `feat/npu-qwen3-stack`):
+Code: the step is Triton-XDNA's op `tl.extra.npu.qwen3_stack` (the fork's `main`, 2ab679b):
 `amd_triton_npu/language/npu/qwen3_stack.py` (weight packing, builds, runs),
 `kernels/qwen3_stack_design.py` (IRON design + runtime sequence), `kernels/qwen3_stack_core.cc`
 (per-core kernels, Peano), `examples/qwen3_stack/` (every build checked on random weights).

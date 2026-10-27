@@ -12,7 +12,7 @@ The work, bottom up:
 |---|---|---|
 | intrinsics | the per-core microkernel: Peano (llvm-aie) intrinsics for VMAC, VSHIFT, cascade, SRS | Triton-XDNA `kernels/conv3x3_cascade.cc` (research copy: `npu_kernels/`) |
 | array design | 16 two-core cascade chains, memtile broadcast, stream-major DDR layout (IRON) | `kernels/conv3x3_design.py`, research: `npu_kernels/conv3x3_strips.py` |
-| Triton | `tl.extra.npu.conv3x3`: build (cached), run (pyxrt), host layouts | Triton-XDNA `amd_triton_npu/language/npu/conv3x3.py`, branch `feat/npu-conv3x3` (a675854, local) |
+| Triton | `tl.extra.npu.conv3x3`: build (cached), run (pyxrt), host layouts | Triton-XDNA `amd_triton_npu/language/npu/conv3x3.py`, a675854 (on the fork's `main`) |
 | torch | `torch.compile(backend="xdna")` turns 3x3 convs into `xdna::conv3x3` | `torch_xdna/conv.py`, `backend.py` |
 
 ## Why a GEMM route can't get there

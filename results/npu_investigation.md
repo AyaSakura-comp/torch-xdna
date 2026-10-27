@@ -53,8 +53,8 @@ both run with raw pyxrt on one persistent hw_context:
 ## 3. Keeping several contexts resident (tools/coresident_exp.py)
 
 Patched Triton-XDNA with `npu_config.device_columns` / `AMD_TRITON_NPU_DEVICE_COLUMNS` so aircc
-targets `npu2_<n>col` (binary claims n columns, relocatable start column; branch
-`feat/device-columns`, local). Findings:
+targets `npu2_<n>col` (binary claims n columns, relocatable start column; now on
+the fork's `main` as 8d31793). Findings:
 
 * npu2_2col with herd (2,4) does not compile: "no ShimNOCTile has 0 input / 1 output DMA
   channel free: all 2 at 2/4 input, 4/4 output used" -- 2 shim tiles cannot feed 6 A/B streams.

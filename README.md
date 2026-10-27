@@ -58,7 +58,7 @@ xdna::linear at run time (runtime.py)
 
 ## 3x3 convolutions: the cascade op
 
-`xdna::conv3x3` runs Triton-XDNA's `tl.extra.npu.conv3x3` (branch `feat/npu-conv3x3`): every
+`xdna::conv3x3` runs Triton-XDNA's `tl.extra.npu.conv3x3` (the fork's `main`): every
 core keeps its weights for the whole image, the input channels are split over a chain of 2 or 4
 vertically adjacent cores whose partial sums meet over the AIE cascade, and the tail core
 requantizes (shift, round, saturate; ReLU as unsigned saturation). The chains fill the array,
@@ -98,8 +98,8 @@ change around each launch, and ~0.1 ms per launch. Under heavier CPU load the fp
 
 ## Whole transformer stacks: one launch per step
 
-`xdna::qwen3_stack` runs Triton-XDNA's `tl.extra.npu.qwen3_stack` (branch
-`feat/npu-qwen3-stack`): every layer of a Qwen3-0.6B-sized stack (hidden 1024, 16 query / 8 kv
+`xdna::qwen3_stack` runs Triton-XDNA's `tl.extra.npu.qwen3_stack` (the fork's
+`main`): every layer of a Qwen3-0.6B-sized stack (hidden 1024, 16 query / 8 kv
 heads of 128, MLP 3072, any depth), the final norm and a linear head of any width, for two
 sequences, in one launch. bfp16 operands, fp32 accumulation; the GEMMs are cascade chains with
 their norms, residuals and logits fused into the last MAC, RoPE / q-k-norm / online-softmax
@@ -173,7 +173,7 @@ directory mix each other's intermediates, and the mixed binary is cached and
 dispatched without error. Reproduced with two processes building 8 int8 GEMMs each
 in a shared directory: 8 of 16 returned garbage (and kept doing so from the cache);
 0 of 16 with separate directories. torch_xdna now builds in a per-process directory,
-and the Triton-XDNA branch `feat/device-columns` serializes builds with an flock on
+and Triton-XDNA (the fork's `main`, 0e29c35) serializes builds with an flock on
 `<air_project>/.build.lock`. (This is what first looked like a K=512 int8 bug in
 Whisper and a K=768 bf16 bug in GPT-2's LM head: both programs were first built while
 another process was building.)
